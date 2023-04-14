@@ -1,5 +1,5 @@
 /* **********************************************************
- * Copyright (c) 2015-2022 Google, Inc.  All rights reserved.
+ * Copyright (c) 2015-2023 Google, Inc.  All rights reserved.
  * **********************************************************/
 
 /*
@@ -39,6 +39,9 @@
 #include <iomanip>
 #include <sstream>
 #include <string>
+
+// XXX: DR should export this
+#define INVALID_THREAD_ID 0
 
 // XXX: perhaps we should use a C++-ish stream approach instead
 // This cannot be named ERROR as that conflicts with Windows headers.
@@ -96,13 +99,6 @@
 #    define END_PACKED_STRUCTURE __attribute__((__packed__))
 #endif
 
-/* TODO(i#2924): Remove this and others like it once we stop supporting VS2013. */
-#if defined(WINDOWS) && _MSC_VER < 1900
-#    define CONSTEXPR const /* 'constexpr' not supported */
-#else
-#    define CONSTEXPR constexpr
-#endif
-
 #ifndef __has_cpp_attribute
 #    define __has_cpp_attribute(x) 0 // Compatibility with non-clang compilers.
 #endif
@@ -147,6 +143,24 @@ to_hex_string(T integer)
     sstream << "0x" << std::setfill('0') << std::setw(sizeof(T) * 2) << std::hex
             << integer;
     return sstream.str();
+}
+
+static inline bool
+ends_with(const std::string &str, const std::string &with)
+{
+    size_t pos = str.rfind(with);
+    if (pos == std::string::npos)
+        return false;
+    return (pos + with.size() == str.size());
+}
+
+static inline bool
+starts_with(const std::string &str, const std::string &with)
+{
+    size_t pos = str.find(with);
+    if (pos == std::string::npos)
+        return false;
+    return pos == 0;
 }
 
 #endif /* _UTILS_H_ */

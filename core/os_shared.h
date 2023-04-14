@@ -1,5 +1,5 @@
 /* **********************************************************
- * Copyright (c) 2010-2021 Google, Inc.  All rights reserved.
+ * Copyright (c) 2010-2022 Google, Inc.  All rights reserved.
  * Copyright (c) 2003-2010 VMware, Inc.  All rights reserved.
  * **********************************************************/
 
@@ -452,8 +452,11 @@ get_dynamorio_library_path(void);
 size_t
 os_page_size(void);
 #ifdef UNIX
+/* This also tries to set other auxv values. */
 void
 os_page_size_init(const char **env, bool env_followed_by_auxv);
+size_t
+os_minsigstksz(void);
 #endif
 bool
 get_memory_info(const byte *pc, byte **base_pc, size_t *size, uint *prot);
@@ -1075,6 +1078,13 @@ enum {
 #elif defined(AARCHXX)
 enum {
     /* FIXME i#1551, i#1569: this is for A32 for now to get things compiling */
+    JMP_REL32_OPCODE = 0xec000000,
+    JMP_REL32_SIZE = 4,
+    CALL_REL32_OPCODE = 0xed000000,
+};
+#elif defined(RISCV64)
+enum {
+    /* FIXME i#3544: Fix proper values. Those are for compilation only. */
     JMP_REL32_OPCODE = 0xec000000,
     JMP_REL32_SIZE = 4,
     CALL_REL32_OPCODE = 0xed000000,

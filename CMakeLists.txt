@@ -1,5 +1,5 @@
 # **********************************************************
-# Copyright (c) 2010-2022 Google, Inc.    All rights reserved.
+# Copyright (c) 2010-2023 Google, Inc.    All rights reserved.
 # Copyright (c) 2009-2010 VMware, Inc.    All rights reserved.
 # Copyright (c) 2018 Arm Limited          All rights reserved.
 # **********************************************************
@@ -181,6 +181,9 @@ endif()
 # The target OS:
 if (APPLE)
   set(MACOS 1)
+  # Ensure our binaries can run on older OSX but only as far back as is
+  # officially supported by Apple.
+  set(OLDEST_OSX_SUPPPORTED "11.7")
 elseif (UNIX)
   set(LINUX 1)
 endif (APPLE)
@@ -216,14 +219,18 @@ endif ()
 # For cross-compilation this should still work as you're supposed to set this var.
 # X64 mean 64-bit generically, whether AMD64 or AARCH64.
 set(TARGET_ARCH "${CMAKE_SYSTEM_PROCESSOR}" CACHE STRING "Target architecture")
-if (TARGET_ARCH MATCHES "^arm")
-  set(ARM 1) # This means AArch32.
-  set(X64 OFF)
-  message(STATUS "Building for ARM")
-elseif (TARGET_ARCH MATCHES "^aarch64")
+if (TARGET_ARCH MATCHES "^arm64" OR TARGET_ARCH MATCHES "^aarch64")
   set(AARCH64 1)
   set(X64 1)
   message(STATUS "Building for AArch64")
+elseif (TARGET_ARCH MATCHES "^arm")
+  set(ARM 1) # This means AArch32.
+  set(X64 OFF)
+  message(STATUS "Building for ARM")
+elseif (TARGET_ARCH MATCHES "^riscv64")
+  set(RISCV64 1)
+  set(X64 1)
+  message(STATUS "Building for riscv64")
 else ()
   set(X86 1) # This means IA-32 or AMD64
   message(STATUS "Building for x86")
@@ -250,6 +257,8 @@ elseif (ARM)
   set(ARCH_NAME arm)
 elseif (AARCH64)
   set(ARCH_NAME aarch64)
+elseif (RISCV64)
+  set(ARCH_NAME riscv64)
 else ()
   message(FATAL_ERROR "Unknown architecture target")
 endif ()
@@ -263,16 +272,21 @@ endif ()
 
 # The execution architecture, which might differ from the target for building
 # an AArch64 decoder to execute on x86 machines (i#1684).
-if (CMAKE_SYSTEM_PROCESSOR MATCHES "^arm")
-  set(DR_HOST_ARM 1)
-  set(DR_HOST_ARCH_NAME "arm")
-  set(DR_HOST_AARCHXX 1)
-  set(DR_HOST_ARCH_NAME_SHARED aarchxx)
-elseif (CMAKE_SYSTEM_PROCESSOR MATCHES "^aarch64")
+if (CMAKE_SYSTEM_PROCESSOR MATCHES "^aarch64" OR CMAKE_SYSTEM_PROCESSOR MATCHES "^arm64")
   set(DR_HOST_AARCH64 1)
   set(DR_HOST_ARCH_NAME "aarch64")
   set(DR_HOST_AARCHXX 1)
   set(DR_HOST_ARCH_NAME_SHARED aarchxx)
+  set(DR_HOST_X64 1)
+elseif (CMAKE_SYSTEM_PROCESSOR MATCHES "^arm")
+  set(DR_HOST_ARM 1)
+  set(DR_HOST_ARCH_NAME "arm")
+  set(DR_HOST_AARCHXX 1)
+  set(DR_HOST_ARCH_NAME_SHARED aarchxx)
+elseif (CMAKE_SYSTEM_PROCESSOR MATCHES "^riscv64")
+  set(DR_HOST_RISCV64 1)
+  set(DR_HOST_ARCH_NAME "riscv64")
+  set(DR_HOST_ARCH_NAME_SHARED ${DR_HOST_ARCH_NAME})
   set(DR_HOST_X64 1)
 elseif (CMAKE_C_SIZEOF_DATA_PTR EQUAL 8)
   set(DR_HOST_X86 1)
@@ -298,6 +312,10 @@ if (NOT "${TARGET_ARCH}" STREQUAL "${CMAKE_SYSTEM_PROCESSOR}")
   if (ARM)
     # TODO i#1684: We don't have full support for targeting arm in i386 yet.
     message(FATAL_ERROR "Targeting ARM on i386 is not yet supported: i#1684.")
+  endif ()
+  if (RISCV64)
+    # TODO #1684: We don't have full support for targeting RISC-V in i386 yet.
+    message(FATAL_ERROR "Targeting riscv64 on i386 is not yet supported.")
   endif ()
 endif ()
 
@@ -547,9 +565,9 @@ else (EXISTS "${PROJECT_SOURCE_DIR}/.svn")
   endif (EXISTS "${PROJECT_SOURCE_DIR}/.git")
 endif (EXISTS "${PROJECT_SOURCE_DIR}/.svn")
 
-# N.B.: when updating this, update the default version in ci-package.yml.
-# We should find a way to share (xref i#1565).
-set(VERSION_NUMBER_DEFAULT "9.0.${VERSION_NUMBER_PATCHLEVEL}")
+# N.B.: When updating this, update all the default versions in ci-package.yml
+# and ci-docs.yml.  We should find a way to share (xref i#1565).
+set(VERSION_NUMBER_DEFAULT "9.92.${VERSION_NUMBER_PATCHLEVEL}")
 # do not store the default VERSION_NUMBER in the cache to prevent a stale one
 # from preventing future version updates in a pre-existing build dir
 set(VERSION_NUMBER "" CACHE STRING "Version number: leave empty for default")
@@ -828,12 +846,7 @@ if (UNIX)
     endif (X64)
   endif ()
   if (APPLE AND CMAKE_COMPILER_IS_CLANG)
-    # Ensure our binaries can run on older OSX
-    # We're building our release package on 10.14, and that XCode does not
-    # supply C++ libraries for below 10.9, causing drcachesim to fail to build.
-    # Thus we have abandoned support for below 10.9.
-    # If this is updated, update drcachesim's as well.
-    set(BASE_CFLAGS "${BASE_CFLAGS} -mmacosx-version-min=10.9")
+    set(BASE_CFLAGS "${BASE_CFLAGS} -mmacosx-version-min=${OLDEST_OSX_SUPPPORTED}")
   endif ()
   if (APPLE)
     set(ld_entry_flag "-e")
@@ -1217,13 +1230,28 @@ else ()
   set(HAVE_HALF_FLOAT OFF)
 endif ()
 
-# Right now we only build libipt on Linux x86_64.
-# We define a variable to indicate whether DR will build libipt.
+set(BUILD_PT_TRACER OFF)
+set(BUILD_PT_POST_PROCESSOR OFF)
+set(proc_supports_pt OFF)
+# Right now we only build PT related libraries on Linux x86_64.
 if (LINUX AND X86 AND X64)
-  set(HAVE_LIBIPT ON)
-else ()
-  set(HAVE_LIBIPT OFF)
-endif ()
+  # We will always build the PT tracer on Linux X86_64 no matter whether the system
+  # supports PT, because users may want to use the built binaries on a different system
+  # that does not support PT itself.
+  set(BUILD_PT_TRACER ON)
+  # Check if the building machine supports Intel PT. This function only checks if
+  # PT-related tests need to be built. PT-capable binaries can be built on any system.
+  check_intel_pt_support(proc_supports_pt)
+  # libdrpt2ir and drpt2trace depend on libipt. If the libipt submodule is not
+  # initialized, cmake will report a warning here.
+  if (EXISTS "${PROJECT_SOURCE_DIR}/third_party/libipt/.git" )
+    set(BUILD_PT_POST_PROCESSOR ON)
+  else ()
+    message(STATUS "libipt submodule is not initialized. libdrpt2ir and drpt2trace will not be built.")
+  endif ()
+else (LINUX AND X86 AND X64)
+  message(STATUS "PT related libraries only supported on Linux x86_64")
+endif (LINUX AND X86 AND X64)
 
 ###########################################################################
 
@@ -1354,7 +1382,7 @@ math(EXPR VERSION_NUMBER_INTEGER
 # 5.0 broke backcompat in drsyms and xmm opnd sizes
 # 4.1 broke backcompat in drsyms + 64-bit core (opcodes + reachability)
 # 4.0 broke backcompat in drmgr, drsyms, drinjectlib, and dr_get_milliseconds()
-set(OLDEST_COMPATIBLE_VERSION_DEFAULT "900")
+set(OLDEST_COMPATIBLE_VERSION_DEFAULT "990")
 set(OLDEST_COMPATIBLE_VERSION "" CACHE STRING
   "Oldest compatible version: leave empty for default")
 if ("${OLDEST_COMPATIBLE_VERSION}" STREQUAL "")
@@ -1727,6 +1755,8 @@ endif ()
 add_custom_target(api_headers)
 if (AARCH64)
   add_dependencies(api_headers gen_aarch64_codec gen_aarch64_opcodes)
+elseif(RISCV64)
+  add_dependencies(api_headers gen_riscv64_codec gen_riscv64_headers)
 endif()
 
 DR_export_header(${PROJECT_SOURCE_DIR}/core/lib/dr_app.h dr_app.h)
@@ -1774,26 +1804,47 @@ function (link_with_pthread target)
   endif ()
 endfunction ()
 
+function (mac_add_inc_and_lib header lib)
+  # Locate include and lib directories on MacOS.
+  # TODO: Write proper package for snappy and lz4 lookup.
+  find_path(INCLUDE_DIR ${header} HINTS /usr/local/include /opt/homebrew/include)
+  if (INCLUDE_DIR)
+    include_directories(${INCLUDE_DIR})
+  else ()
+    message(WARNING "Failed to locate header ${header}")
+  endif ()
+  find_path(LIB_DIR ${lib} HINTS /usr/local/lib /opt/homebrew/lib)
+  if (LIB_DIR)
+    link_directories(${LIB_DIR})
+  else ()
+    message(WARNING "Failed to locate lib ${lib}")
+  endif ()
+endfunction ()
+
 # zlib, snappy, and lz4 are used for some clients/ and tests.
-find_package(ZLIB)
+# TODO i#5767: Install an explicit zlib package on our Windows GA CI images
+# (this find_package finds a strawberry perl zlib which causes 32-bit build
+# and 64-bit private loader issues).
+if (WIN32 AND AUTOMATED_TESTING)
+  set(ZLIB_FOUND OFF)
+else ()
+  find_package(ZLIB)
+endif ()
 # On Ubuntu 14.10, 32-bit builds fail to link with -lsnappy, just ignore.
 if (UNIX AND X64)
   find_library(libsnappy snappy)
   if (libsnappy)
     message(STATUS "Found snappy: ${libsnappy}")
+    if (APPLE)
+      mac_add_inc_and_lib(snappy.h libsnappy.a)
+    endif ()
   endif ()
-  # Locate non-standard snappy directories on macOS.
-  # TODO: Write proper package for snappy lookup.
-  if (libsnappy AND APPLE)
-    find_path(SNAPPY_INCLUDE_DIR snappy.h HINTS /usr/local/include)
-    find_path(SNAPPY_LIB_DIR libsnappy.a HINTS /usr/local/lib)
-    include_directories(${SNAPPY_INCLUDE_DIR})
-    link_directories(${SNAPPY_LIB_DIR})
-  endif ()
-
   find_library(liblz4 lz4)
   if (liblz4)
     message(STATUS "Found liblz4: ${liblz4}")
+    if (APPLE)
+      mac_add_inc_and_lib(lz4.h liblz4.a)
+    endif ()
   endif ()
 endif ()
 

@@ -1,5 +1,5 @@
 /* **********************************************************
- * Copyright (c) 2011-2021 Google, Inc.  All rights reserved.
+ * Copyright (c) 2011-2023 Google, Inc.  All rights reserved.
  * Copyright (c) 2000-2010 VMware, Inc.  All rights reserved.
  * **********************************************************/
 
@@ -216,8 +216,8 @@ typedef byte *cache_pc; /* fragment cache pc */
 #endif
 
 /* make sure defines are consistent */
-#if !defined(X86) && !defined(ARM) && !defined(AARCH64)
-#    error Must define X86, ARM or AARCH64: no other platforms are supported
+#if !defined(X86) && !defined(ARM) && !defined(AARCH64) && !defined(RISCV64)
+#    error Must define X86, ARM, AARCH64 or RISCV64: no other platforms are supported
 #endif
 
 #if defined(PAPI) && defined(WINDOWS)
@@ -296,6 +296,14 @@ typedef struct _thread_record_t {
 #    undef DYNAMORIO_EXPORT
 #    define DYNAMORIO_EXPORT DR_APP_API
 #endif
+
+/* AArch64 Scalable Vector Extension's vector length in bits. This depends on
+ * the hardware implementation and can be one of:
+ * 128 256 384 512 640 768 896 1024 1152 1280 1408 1536 1664 1792 1920 2048
+ * See https://developer.arm.com/documentation/102476/0100/Introducing-SVE
+ * This variable stores the length for off-line decoding.
+ */
+extern int sve_veclen;
 
 #include "heap.h"
 #include "options_struct.h"
@@ -431,6 +439,12 @@ extern bool dynamo_exited_log_and_stats; /* are stats and logfile shut down? */
 #endif
 extern bool dynamo_resetting;           /* in middle of global reset? */
 extern bool dynamo_all_threads_synched; /* are all other threads suspended safely? */
+/* This indicates mostly whether there might be other threads in the process when
+ * DR initializes, which equates to attaching (vs being launched by DR) on Linux.
+ * On Windows though we can't really tell the difference due to our late injection,
+ * so this is always set on Windows.
+ */
+extern bool dynamo_control_via_attach;
 /* Not guarded by DR_APP_EXPORTS because later detach implementations might not
  * go through the app interface.
  */
@@ -1188,7 +1202,9 @@ strtoul(const char *str, char **end, int base);
 #    define sigaltstack sigaltstack_forbidden_function
 #    define setitimer setitimer_forbidden_function
 #    define _exit _exit_forbidden_function
-#    define gettimeofday gettimeofday_forbidden_function
+#    if !(defined(MACOS) && defined(AARCH64))
+#        define gettimeofday gettimeofday_forbidden_function
+#    endif
 #    define time time_forbidden_function
 #    define modify_ldt modify_ldt_forbidden_function
 #endif

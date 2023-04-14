@@ -175,6 +175,13 @@ typedef struct {
         unsigned long uc_regspace[128] __attribute__((__aligned__(8)));
         kernel_vfp_sigframe_t uc_vfp;
     } coproc;
+#    elif defined(RISCV64)
+    unsigned long uc_flags;
+    struct ucontext *uc_link;
+    stack_t uc_stack;
+    kernel_sigset_t uc_sigmask;
+    unsigned char sigset_ex[1024 / 8 - sizeof(kernel_sigset_t)];
+    sigcontext_t uc_mcontext;
 #    else
 #        error NYI
 #    endif
@@ -274,6 +281,10 @@ typedef struct rt_sigframe {
     kernel_siginfo_t info;
     kernel_ucontext_t uc;
     char retcode[RETCODE_SIZE];
+#    elif defined(RISCV64)
+    kernel_siginfo_t info;
+    kernel_ucontext_t uc;
+    char retcode[RETCODE_SIZE];
 #    endif
 
 #elif defined(MACOS)
@@ -288,9 +299,13 @@ typedef struct rt_sigframe {
      * like on Linux?  We would get the size by counting from "info".
      * Also, should we change this to sigcontext_t.
      */
+#        if defined(AARCH64)
+    struct __darwin_mcontext64 mc;
+#        else
     struct __darwin_mcontext_avx64 mc; /* sigcontext, "struct mcontext_avx64" to kernel */
-    kernel_siginfo_t info;             /* matches user-mode sys/signal.h struct */
-    struct __darwin_ucontext64 uc;     /* "struct user_ucontext64" to kernel */
+#        endif
+    kernel_siginfo_t info;         /* matches user-mode sys/signal.h struct */
+    struct __darwin_ucontext64 uc; /* "struct user_ucontext64" to kernel */
 #    else
     app_pc retaddr;
     app_pc handler;

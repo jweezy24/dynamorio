@@ -59,7 +59,7 @@ public:
     std::string
     parallel_shard_error(void *shard_data) override;
 
-protected:
+    // i#3068: We use the following struct to also export the counters.
     struct counters_t {
         counters_t()
         {
@@ -83,10 +83,32 @@ protected:
             other_markers += rhs.other_markers;
             icache_flushes += rhs.icache_flushes;
             dcache_flushes += rhs.dcache_flushes;
+            encodings += rhs.encodings;
             for (const uint64_t addr : rhs.unique_pc_addrs) {
                 unique_pc_addrs.insert(addr);
             }
             return *this;
+        }
+        bool
+        operator==(const counters_t &rhs)
+        {
+            // memcmp doesn't work with the unordered_set member. Also,
+            // cannot compare till offsetof(basic_counts_t::counters_t, unique_pc_addrs)
+            // as it gives a non-standard-layout type warning on osx.
+            return instrs == rhs.instrs && instrs_nofetch == rhs.instrs_nofetch &&
+                prefetches == rhs.prefetches && loads == rhs.loads &&
+                stores == rhs.stores && sched_markers == rhs.sched_markers &&
+                xfer_markers == rhs.xfer_markers &&
+                func_id_markers == rhs.func_id_markers &&
+                func_retaddr_markers == rhs.func_retaddr_markers &&
+                func_arg_markers == rhs.func_arg_markers &&
+                func_retval_markers == rhs.func_retval_markers &&
+                phys_addr_markers == rhs.phys_addr_markers &&
+                phys_unavail_markers == rhs.phys_unavail_markers &&
+                other_markers == rhs.other_markers &&
+                icache_flushes == rhs.icache_flushes &&
+                dcache_flushes == rhs.dcache_flushes && encodings == rhs.encodings &&
+                unique_pc_addrs == rhs.unique_pc_addrs;
         }
         int_least64_t instrs = 0;
         int_least64_t instrs_nofetch = 0;
@@ -104,8 +126,15 @@ protected:
         int_least64_t other_markers = 0;
         int_least64_t icache_flushes = 0;
         int_least64_t dcache_flushes = 0;
+        // The encoding entries aren't exposed at the memref_t level, but
+        // we use encoding_is_new as a proxy.
+        int_least64_t encodings = 0;
         std::unordered_set<uint64_t> unique_pc_addrs;
     };
+    counters_t
+    get_total_counts();
+
+protected:
     struct per_shard_t {
         per_shard_t()
         {
@@ -116,6 +145,7 @@ protected:
         std::vector<counters_t> counters;
         std::string error;
         intptr_t last_window = -1;
+        intptr_t filetype_ = -1;
     };
 
     static bool

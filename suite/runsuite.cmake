@@ -49,6 +49,7 @@ set(arg_package OFF)
 set(arg_require_format OFF)
 set(cross_aarchxx_linux_only OFF)
 set(cross_android_only OFF)
+set(cross_riscv64_linux_only OFF)
 set(arg_debug_only OFF) # Only build the main debug builds.
 set(arg_nontest_only OFF) # Only build configs with no tests.
 foreach (arg ${CTEST_SCRIPT_ARG})
@@ -56,6 +57,9 @@ foreach (arg ${CTEST_SCRIPT_ARG})
     set(arg_automated_ci ON)
     if ($ENV{DYNAMORIO_CROSS_AARCHXX_LINUX_ONLY} MATCHES "yes")
       set(cross_aarchxx_linux_only ON)
+    endif()
+    if ($ENV{DYNAMORIO_CROSS_RISCV64_LINUX_ONLY} MATCHES "yes")
+      set(cross_riscv64_linux_only ON)
     endif()
     if ($ENV{DYNAMORIO_CROSS_ANDROID_ONLY} MATCHES "yes")
       set(cross_android_only ON)
@@ -76,6 +80,19 @@ foreach (arg ${CTEST_SCRIPT_ARG})
     set(arg_nontest_only ON)
   endif ()
 endforeach (arg)
+
+if (UNIX AND NOT APPLE AND NOT ANDROID)
+  execute_process(COMMAND ldd --version
+    RESULT_VARIABLE ldd_result ERROR_VARIABLE ldd_err OUTPUT_VARIABLE ldd_out)
+  if (ldd_result OR ldd_err)
+    # Failed; just move on.
+  elseif (ldd_out MATCHES "GLIBC 2.3[5-9]")
+    # XXX i#5437, i#5431: While we work through Ubuntu22 issues we run
+    # just a few tests.
+    set(extra_ctest_args INCLUDE_LABEL UBUNTU_22)
+    set(arg_debug_only ON)
+  endif ()
+endif ()
 
 set(build_tests "BUILD_TESTS:BOOL=ON")
 
@@ -101,10 +118,14 @@ if (arg_automated_ci)
     # to be off, ruining the samples for interactive use.
     set(build_tests "")
     message("Detected a cron package build: disabling running of tests")
+    # We want the same Github Actions settings for building as we have for continuous
+    # testing so we set AUTOMATED_TESTING.
+    set(base_cache "${base_cache}
+AUTOMATED_TESTING:BOOL=ON")
   else ()
     # Disable -msgbox_mask by default to avoid hangs on cases where DR hits errors
     # prior to option parsing.
-    set(build_tests "${build_tests}
+    set(base_cache "${base_cache}
 AUTOMATED_TESTING:BOOL=ON")
     # We assume our GitHub Actions automated CI has password-less sudo.
     # Our Jenkins tester does not.  CI_TRIGGER is only set for Actions.
@@ -223,8 +244,8 @@ endif ()
 # However, there's no simple way to do that.  For now we punt until someone
 # changes one of those.
 #
-# Prefer named version 9.0 from apt.llvm.org.
-find_program(CLANG_FORMAT_DIFF clang-format-diff-9 DOC "clang-format-diff")
+# Prefer named version 14.0 from apt.llvm.org.
+find_program(CLANG_FORMAT_DIFF clang-format-diff-14 DOC "clang-format-diff")
 if (NOT CLANG_FORMAT_DIFF)
   find_program(CLANG_FORMAT_DIFF clang-format-diff DOC "clang-format-diff")
 endif ()
@@ -302,7 +323,8 @@ endif ()
 # also turned on for release-external-64, but ctest will run with label
 # RUN_IN_RELEASE.
 
-if (NOT cross_aarchxx_linux_only AND NOT cross_android_only AND NOT a64_on_x86_only)
+if (NOT cross_riscv64_linux_only AND NOT cross_aarchxx_linux_only AND
+  NOT cross_android_only AND NOT a64_on_x86_only)
   # For cross-arch execve test we need to "make install"
   if (NOT arg_nontest_only)
     testbuild_ex("debug-internal-32" OFF "
@@ -400,7 +422,8 @@ if (NOT cross_aarchxx_linux_only AND NOT cross_android_only AND NOT a64_on_x86_o
         ")
     endif (DO_ALL_BUILDS)
   endif (ARCH_IS_X86 AND NOT APPLE)
-endif (NOT cross_aarchxx_linux_only AND NOT cross_android_only AND NOT a64_on_x86_only)
+endif (NOT cross_riscv64_linux_only AND NOT cross_aarchxx_linux_only AND
+  NOT cross_android_only AND NOT a64_on_x86_only)
 
 if (UNIX AND ARCH_IS_X86)
   # Optional cross-compilation for ARM/Linux and ARM/Android if the cross
@@ -527,6 +550,37 @@ if (ARCH_IS_X86 AND UNIX AND (a64_on_x86_only OR NOT arg_automated_ci))
     INTERNAL:BOOL=ON
     ${build_tests}
     " OFF ${arg_package} "")
+endif ()
+
+if (ARCH_IS_X86 AND UNIX)
+  # TODO i#3544: Run tests under QEMU
+  set(orig_extra_ctest_args ${extra_ctest_args})
+  set(prev_optional_cross_compile ${optional_cross_compile})
+  set(prev_run_tests ${run_tests})
+  set(run_tests OFF)
+  if (NOT cross_riscv64_linux_only)
+    set(optional_cross_compile ON)
+  endif ()
+  set(ARCH_IS_X86 OFF)
+  # TODO i#3544: Port tests to RISCV and build them in the workflow.
+  set(build_tests "BUILD_TESTS:BOOL=ON")
+
+  testbuild_ex("riscv64-debug-internal" ON "
+    DEBUG:BOOL=ON
+    INTERNAL:BOOL=ON
+    ${build_tests}
+    CMAKE_TOOLCHAIN_FILE:PATH=${CTEST_SOURCE_DIRECTORY}/make/toolchain-riscv64.cmake
+    " OFF ${arg_package} "")
+  testbuild_ex("riscv64-release-external" ON "
+    DEBUG:BOOL=OFF
+    INTERNAL:BOOL=OFF
+    CMAKE_TOOLCHAIN_FILE:PATH=${CTEST_SOURCE_DIRECTORY}/make/toolchain-riscv64.cmake
+    " OFF ${arg_package} "")
+
+  set(run_tests ${prev_run_tests})
+  set(extra_ctest_args ${orig_extra_ctest_args})
+  set(optional_cross_compile ${prev_optional_cross_compile})
+
 endif ()
 
 # XXX: do we still care about these builds?

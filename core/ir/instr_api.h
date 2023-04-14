@@ -1,5 +1,5 @@
 /* **********************************************************
- * Copyright (c) 2010-2021 Google, Inc.  All rights reserved.
+ * Copyright (c) 2010-2022 Google, Inc.  All rights reserved.
  * Copyright (c) 2002-2010 VMware, Inc.  All rights reserved.
  * **********************************************************/
 
@@ -147,6 +147,16 @@ typedef enum _dr_pred_type_t {
     DR_PRED_HS = DR_PRED_CS, /**< ARM condition: alias for DR_PRED_CS. */
     DR_PRED_LO = DR_PRED_CC, /**< ARM condition: alias for DR_PRED_CC. */
 #endif
+#ifdef RISCV64
+    /* FIXME i#3544: RISC-V does not have compare flag register! */
+    /* Aliases for XINST_CREATE_jump_cond() and other cross-platform routines. */
+    DR_PRED_EQ, /**< Condition code: equal. */
+    DR_PRED_NE, /**< Condition code: not equal. */
+    DR_PRED_LT, /**< Condition code: signed less than. */
+    DR_PRED_LE, /**< Condition code: signed less than or equal. */
+    DR_PRED_GT, /**< Condition code: signed greater than. */
+    DR_PRED_GE, /**< Condition code: signed greater than or equal. */
+#endif
 } dr_pred_type_t;
 
 /**
@@ -278,9 +288,8 @@ struct _instr_t {
     uint eflags;   /* contains EFLAGS_ bits, but amount of info varies
                     * depending on how instr was decoded/built */
 
-    /* this field is for the use of passes as an annotation.
-     * it is also used to hold the offset of an instruction when encoding
-     * pc-relative instructions. A small range of values is reserved for internal use
+    /* This field is for the use of passes as an annotation.
+     * A small range of values is reserved for internal use
      * by DR and cannot be used by clients; see DR_NOTE_FIRST_RESERVED in globals.h.
      */
     void *note;
@@ -289,6 +298,8 @@ struct _instr_t {
     instr_t *prev;
     instr_t *next;
 
+    /* Used to hold the relative offset within an instruction list when encoding. */
+    size_t offset;
 };     /* instr_t */
 #endif /* DR_FAST_IR */
 
@@ -480,9 +491,6 @@ DR_API
 INSTR_INLINE
 /**
  * Gets the value of the user-controlled note field in \p instr.
- * \note Important: is also used when emitting for targets that are other
- * instructions.  Thus it will be overwritten when calling instrlist_encode()
- * or instrlist_encode_to_copy() with \p has_instr_jmp_targets set to true.
  * \note The note field is copied (shallowly) by instr_clone().
  */
 void *
@@ -2076,6 +2084,16 @@ instr_create_1dst_5src(void *drcontext, int opcode, opnd_t dst, opnd_t src1, opn
 DR_API
 /**
  * Convenience routine that returns an initialized instr_t allocated on the
+ * thread-local heap with opcode \p opcode, one destination (\p dst),
+ * and six sources (\p src1, \p src2, \p src3, \p src4, \p src5, \p src6).
+ */
+instr_t *
+instr_create_1dst_6src(void *drcontext, int opcode, opnd_t dst, opnd_t src1, opnd_t src2,
+                       opnd_t src3, opnd_t src4, opnd_t src5, opnd_t src6);
+
+DR_API
+/**
+ * Convenience routine that returns an initialized instr_t allocated on the
  * thread-local heap with opcode \p opcode, two destinations (\p dst1, \p dst2)
  * and no sources.
  */
@@ -2533,6 +2551,19 @@ enum {
 #    define EFLAGS_MSR_G 0x4
 /** The bits in the 4-bit OP_msr immediate that select the nzcvqg status flags. */
 #    define EFLAGS_MSR_NZCVQG (EFLAGS_MSR_NZCVQ | EFLAGS_MSR_G)
+#elif defined(RISCV64)
+/* FIXME i#3544: Not implemented */
+/** Platform-independent macro for reads all arithmetic flags. */
+#    define EFLAGS_READ_ARITH 0
+#    define EFLAGS_READ_ALL 0      /**< Reads all flags. */
+#    define EFLAGS_READ_NON_PRED 0 /**< Flags not read by predicates. */
+/** Platform-independent macro for writes all arithmetic flags. */
+#    define EFLAGS_WRITE_ARITH 0
+#    define EFLAGS_WRITE_ALL 0 /**< Writes all flags. */
+/** Converts an EFLAGS_WRITE_* value to the corresponding EFLAGS_READ_* value. */
+#    define EFLAGS_WRITE_TO_READ(x) (x)
+/** Converts an EFLAGS_READ_* value to the corresponding EFLAGS_WRITE_* value. */
+#    define EFLAGS_READ_TO_WRITE(x) (x)
 #endif /* X86 */
 
 #endif /* _DR_IR_INSTR_H_ */

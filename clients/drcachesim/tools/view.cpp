@@ -1,5 +1,5 @@
 /* **********************************************************
- * Copyright (c) 2017-2022 Google, Inc.  All rights reserved.
+ * Copyright (c) 2017-2023 Google, Inc.  All rights reserved.
  * **********************************************************/
 
 /*
@@ -70,15 +70,15 @@ view_t::view_t(const std::string &module_file_path, memref_tid_t thread,
     , num_disasm_instrs_(0)
     , prev_tid_(-1)
     , filetype_(-1)
-    , num_refs_(0)
     , timestamp_(0)
     , has_modules_(true)
 {
 }
 
 std::string
-view_t::initialize()
+view_t::initialize_stream(memtrace_stream_t *serial_stream)
 {
+    serial_stream_ = serial_stream;
     print_header();
     dcontext_.dcontext = dr_standalone_init();
     if (module_file_path_.empty()) {
@@ -90,9 +90,11 @@ view_t::initialize()
     }
     if (!has_modules_) {
         // Continue but omit disassembly to support cases where binaries are
-        // not available.
+        // not available and OFFLINE_FILE_TYPE_ENCODINGS is not present.
         return "";
     }
+    // Legacy trace support where binaries are needed.
+    // We do not support non-module code for such traces.
     module_mapper_ =
         module_mapper_t::create(directory_.modfile_bytes_, nullptr, nullptr, nullptr,
                                 nullptr, knob_verbose_, knob_alt_module_dir_);
@@ -122,9 +124,10 @@ view_t::parallel_shard_supported()
 }
 
 void *
-view_t::parallel_shard_init(int shard_index, void *worker_data)
+view_t::parallel_shard_init_stream(int shard_index, void *worker_data,
+                                   memtrace_stream_t *shard_stream)
 {
-    return nullptr;
+    return shard_stream;
 }
 
 bool
@@ -142,15 +145,8 @@ view_t::parallel_shard_error(void *shard_data)
 }
 
 bool
-view_t::parallel_shard_memref(void *shard_data, const memref_t &memref)
+view_t::should_skip(memtrace_stream_t *memstream, const memref_t &memref)
 {
-    return process_memref(memref);
-}
-
-bool
-view_t::should_skip(const memref_t &memref)
-{
-    num_refs_++;
     if (skip_refs_left_ > 0) {
         skip_refs_left_--;
         // I considered printing the version and filetype even when skipped but
@@ -163,7 +159,8 @@ view_t::should_skip(const memref_t &memref)
             return true;
         sim_refs_left_--;
         if (sim_refs_left_ == 0 && timestamp_ > 0) {
-            print_prefix(memref, -1); // Already incremented for timestamp.
+            // Print this timestamp right before the final record.
+            print_prefix(memstream, memref, timestamp_record_ord_);
             std::cerr << "<marker: timestamp " << timestamp_ << ">\n";
             timestamp_ = 0;
         }
@@ -174,6 +171,13 @@ view_t::should_skip(const memref_t &memref)
 bool
 view_t::process_memref(const memref_t &memref)
 {
+    return parallel_shard_memref(serial_stream_, memref);
+}
+
+bool
+view_t::parallel_shard_memref(void *shard_data, const memref_t &memref)
+{
+    memtrace_stream_t *memstream = reinterpret_cast<memtrace_stream_t *>(shard_data);
     if (knob_thread_ > 0 && memref.data.tid > 0 && memref.data.tid != knob_thread_)
         return true;
     // Even for -skip_refs we need to process the up-front version and type.
@@ -181,21 +185,23 @@ view_t::process_memref(const memref_t &memref)
         switch (memref.marker.marker_type) {
         case TRACE_MARKER_TYPE_VERSION:
             // We delay printing until we know the tid.
-            if (trace_version_ == -1)
+            if (trace_version_ == -1) {
                 trace_version_ = static_cast<int>(memref.marker.marker_value);
-            else if (trace_version_ != static_cast<int>(memref.marker.marker_value)) {
+            } else if (trace_version_ != static_cast<int>(memref.marker.marker_value)) {
                 error_string_ = std::string("Version mismatch across files");
                 return false;
             }
+            version_record_ord_ = memstream->get_record_ordinal();
             return true; // Do not count toward -sim_refs yet b/c we don't have tid.
         case TRACE_MARKER_TYPE_FILETYPE:
             // We delay printing until we know the tid.
-            if (filetype_ == -1)
+            if (filetype_ == -1) {
                 filetype_ = static_cast<intptr_t>(memref.marker.marker_value);
-            else if (filetype_ != static_cast<intptr_t>(memref.marker.marker_value)) {
+            } else if (filetype_ != static_cast<intptr_t>(memref.marker.marker_value)) {
                 error_string_ = std::string("Filetype mismatch across files");
                 return false;
             }
+            filetype_record_ord_ = memstream->get_record_ordinal();
             if (TESTANY(OFFLINE_FILE_TYPE_ARCH_ALL, memref.marker.marker_value) &&
                 !TESTANY(build_target_arch_type(), memref.marker.marker_value)) {
                 error_string_ = std::string("Architecture mismatch: trace recorded on ") +
@@ -211,7 +217,8 @@ view_t::process_memref(const memref_t &memref)
             // We can't easily reorder and place window markers before timestamps
             // since memref iterators use the timestamps to order buffer units.
             timestamp_ = memref.marker.marker_value;
-            if (should_skip(memref))
+            timestamp_record_ord_ = memstream->get_record_ordinal();
+            if (should_skip(memstream, memref))
                 timestamp_ = 0;
             return true;
         default: break;
@@ -225,21 +232,21 @@ view_t::process_memref(const memref_t &memref)
         printed_header_.find(memref.marker.tid) == printed_header_.end()) {
         printed_header_.insert(memref.marker.tid);
         if (trace_version_ != -1) { // Old versions may not have a version marker.
-            if (!should_skip(memref)) {
-                print_prefix(memref);
+            if (!should_skip(memstream, memref)) {
+                print_prefix(memstream, memref, version_record_ord_);
                 std::cerr << "<marker: version " << trace_version_ << ">\n";
             }
         }
         if (filetype_ != -1) { // Handle old/malformed versions.
-            if (!should_skip(memref)) {
-                print_prefix(memref);
+            if (!should_skip(memstream, memref)) {
+                print_prefix(memstream, memref, filetype_record_ord_);
                 std::cerr << "<marker: filetype 0x" << std::hex << filetype_ << std::dec
                           << ">\n";
             }
         }
     }
 
-    if (should_skip(memref))
+    if (should_skip(memstream, memref))
         return true;
 
     if (memref.marker.type == TRACE_TYPE_MARKER) {
@@ -248,25 +255,26 @@ view_t::process_memref(const memref_t &memref)
             if (last_window_[memref.marker.tid] != memref.marker.marker_value) {
                 std::cerr
                     << "------------------------------------------------------------\n";
-                print_prefix(memref, -1); // Already incremented for timestamp above.
+                print_prefix(memstream, memref,
+                             -1); // Already incremented for timestamp above.
             }
             if (timestamp_ > 0) {
                 std::cerr << "<marker: timestamp " << timestamp_ << ">\n";
                 timestamp_ = 0;
-                print_prefix(memref);
+                print_prefix(memstream, memref);
             }
             std::cerr << "<marker: window " << memref.marker.marker_value << ">\n";
             last_window_[memref.marker.tid] = memref.marker.marker_value;
         }
         if (timestamp_ > 0) {
-            print_prefix(memref, -1); // Already incremented for timestamp above.
+            print_prefix(memstream, memref, timestamp_record_ord_);
             std::cerr << "<marker: timestamp " << timestamp_ << ">\n";
             timestamp_ = 0;
         }
     }
 
     if (memref.instr.tid != 0) {
-        print_prefix(memref);
+        print_prefix(memstream, memref);
     }
 
     if (memref.marker.type == TRACE_TYPE_MARKER) {
@@ -302,6 +310,10 @@ view_t::process_memref(const memref_t &memref)
             std::cerr << "<marker: rseq abort from 0x" << std::hex
                       << memref.marker.marker_value << std::dec << " to handler>\n";
             break;
+        case TRACE_MARKER_TYPE_RSEQ_ENTRY:
+            std::cerr << "<marker: rseq entry with end at 0x" << std::hex
+                      << memref.marker.marker_value << std::dec << ">\n";
+            break;
         case TRACE_MARKER_TYPE_KERNEL_XFER:
             if (trace_version_ <= TRACE_ENTRY_VERSION_NO_KERNEL_PC) {
                 // Legacy traces just have the module offset.
@@ -322,6 +334,13 @@ view_t::process_memref(const memref_t &memref)
             break;
         case TRACE_MARKER_TYPE_PAGE_SIZE:
             std::cerr << "<marker: page size " << memref.marker.marker_value << ">\n";
+            break;
+        case TRACE_MARKER_TYPE_CHUNK_INSTR_COUNT:
+            std::cerr << "<marker: chunk instruction count " << memref.marker.marker_value
+                      << ">\n";
+            break;
+        case TRACE_MARKER_TYPE_CHUNK_FOOTER:
+            std::cerr << "<marker: chunk footer #" << memref.marker.marker_value << ">\n";
             break;
         case TRACE_MARKER_TYPE_PHYSICAL_ADDRESS:
             std::cerr << "<marker: physical address for following virtual: 0x" << std::hex
@@ -349,6 +368,13 @@ view_t::process_memref(const memref_t &memref)
         case TRACE_MARKER_TYPE_FUNC_RETVAL:
             std::cerr << "<marker: function return value 0x" << std::hex
                       << memref.marker.marker_value << std::dec << ">\n";
+            break;
+        case TRACE_MARKER_TYPE_RECORD_ORDINAL:
+            std::cerr << "<marker: record ordinal 0x" << std::hex
+                      << memref.marker.marker_value << std::dec << ">\n";
+            break;
+        case TRACE_MARKER_TYPE_WINDOW_ID:
+            // Handled above.
             break;
         default:
             std::cerr << "<marker: type " << memref.marker.marker_type << "; value "
@@ -409,7 +435,7 @@ view_t::process_memref(const memref_t &memref)
               << std::setw(2) << memref.instr.size << " byte(s) @ 0x" << std::hex
               << std::setfill('0') << std::setw(sizeof(void *) * 2) << memref.instr.addr
               << std::dec << std::setfill(' ');
-    if (!has_modules_) {
+    if (!TESTANY(OFFLINE_FILE_TYPE_ENCODINGS, filetype_) && !has_modules_) {
         // We can't disassemble so we provide what info the trace itself contains.
         // XXX i#5486: We may want to store the taken target for conditional
         // branches; if added, we can print it here.
@@ -433,17 +459,28 @@ view_t::process_memref(const memref_t &memref)
         return true;
     }
 
-    app_pc mapped_pc;
-    app_pc orig_pc = (app_pc)memref.instr.addr;
-    mapped_pc = module_mapper_->find_mapped_trace_address(orig_pc);
-    if (!module_mapper_->get_last_error().empty()) {
-        error_string_ = "Failed to find mapped address for " +
-            to_hex_string(memref.instr.addr) + ": " + module_mapper_->get_last_error();
-        return false;
+    app_pc decode_pc;
+    const app_pc orig_pc = (app_pc)memref.instr.addr;
+    if (TESTANY(OFFLINE_FILE_TYPE_ENCODINGS, filetype_)) {
+        // The trace has instruction encodings inside it.
+        decode_pc = const_cast<app_pc>(memref.instr.encoding);
+        if (memref.instr.encoding_is_new) {
+            // The code may have changed: invalidate the cache.
+            disasm_cache_.erase(orig_pc);
+        }
+    } else {
+        // Legacy trace support where we need the binaries.
+        decode_pc = module_mapper_->find_mapped_trace_address(orig_pc);
+        if (!module_mapper_->get_last_error().empty()) {
+            error_string_ = "Failed to find mapped address for " +
+                to_hex_string(memref.instr.addr) + ": " +
+                module_mapper_->get_last_error();
+            return false;
+        }
     }
 
     std::string disasm;
-    auto cached_disasm = disasm_cache_.find(mapped_pc);
+    auto cached_disasm = disasm_cache_.find(orig_pc);
     if (cached_disasm != disasm_cache_.end()) {
         disasm = cached_disasm->second;
     } else {
@@ -451,7 +488,7 @@ view_t::process_memref(const memref_t &memref)
         // exported so we just use the same value here.
         char buf[196];
         byte *next_pc = disassemble_to_buffer(
-            dcontext_.dcontext, mapped_pc, orig_pc, /*show_pc=*/false,
+            dcontext_.dcontext, decode_pc, orig_pc, /*show_pc=*/false,
             /*show_bytes=*/true, buf, BUFFER_SIZE_ELEMENTS(buf),
             /*printed=*/nullptr);
         if (next_pc == nullptr) {
@@ -459,13 +496,13 @@ view_t::process_memref(const memref_t &memref)
             return false;
         }
         disasm = buf;
-        disasm_cache_.insert({ mapped_pc, disasm });
+        disasm_cache_.insert({ orig_pc, disasm });
     }
     // Put our prefix on raw byte spillover, and skip the other columns.
     auto newline = disasm.find('\n');
     if (newline != std::string::npos && newline < disasm.size() - 1) {
         std::stringstream prefix;
-        print_prefix(memref, 0, prefix);
+        print_prefix(memstream, memref, -1, prefix);
         std::string skip_name(name_width, ' ');
         disasm.insert(newline + 1,
                       prefix.str() + skip_name + "                               ");

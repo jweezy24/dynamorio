@@ -41,7 +41,7 @@ maintainable.
 
 # Automated Formatting
 
-We employ automated code formatting via [`clang-format` version 9.0](https://releases.llvm.org/9.0.0/tools/clang/docs/ClangFormat.html). The [`.clang-format` top-level file](https://github.com/DynamoRIO/dynamorio/blob/master/.clang-format) specifies the style rules for all `.h`, `.c`, and `.cpp` source code files.  Developers are expected to set up their editors to use `clang-format` when saving each file (see [the `clang-format` documentation](https://releases.llvm.org/6.0.0/tools/clang/docs/ClangFormat.html) for pointers to vim, emacs, and Visual Studio setup instructions).  Our test suite includes a format check and will fail any code whose formatting does not match the `clang-format` output.
+We employ automated code formatting via [`clang-format` version 14.0](https://releases.llvm.org/14.0.0/tools/clang/docs/ClangFormat.html). The [`.clang-format` top-level file](https://github.com/DynamoRIO/dynamorio/blob/master/.clang-format) specifies the style rules for all `.h`, `.c`, and `.cpp` source code files.  Developers are expected to set up their editors to use `clang-format` when saving each file (see [the `clang-format` documentation](https://releases.llvm.org/14.0.0/tools/clang/docs/ClangFormat.html) for pointers to vim, emacs, and Visual Studio setup instructions).  Our test suite includes a format check and will fail any code whose formatting does not match the `clang-format` output.
 
 # Legacy Code
 
@@ -131,6 +131,7 @@ that is not needed outside of its own file.
 -# Do not shadow global variables (or variables in containing scopes) by using
 local variables of the same name: choose a distinct name for the local variable.
 
+-# Template parameters in C++ should have a descriptive CamelCase identifier.
 
 # Types
 
@@ -160,11 +161,11 @@ strcmp() and memcmp(), the use of ! is counter-intuitive.
 
   \b GOOD: `if (p == NULL) ...`
 
-  \e BAD:  `if (p)`
+  \e BAD:  `if (!p)`
 
   \b GOOD: `if (p != NULL) ...`
 
-  \e BAD:  `if (!p)`
+  \e BAD:  `if (p)`
 
   \b GOOD: `if (strncmp(...) == 0) ...`
 

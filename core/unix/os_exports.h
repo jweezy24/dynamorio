@@ -1,5 +1,5 @@
 /* **********************************************************
- * Copyright (c) 2011-2021 Google, Inc.  All rights reserved.
+ * Copyright (c) 2011-2023 Google, Inc.  All rights reserved.
  * Copyright (c) 2000-2010 VMware, Inc.  All rights reserved.
  * **********************************************************/
 
@@ -78,16 +78,22 @@
 #    if defined(MACOS64)
 #        define SEG_TLS SEG_GS     /* DR is sharing the app's segment. */
 #        define LIB_SEG_TLS SEG_GS /* libc+loader tls */
+#        define STR_SEG "gs"
+#        define STR_LIB_SEG "gs"
 #    elif defined(X64)
 #        define SEG_TLS SEG_GS
 #        define ASM_SEG "%gs"
 #        define LIB_SEG_TLS SEG_FS /* libc+loader tls */
 #        define LIB_ASM_SEG "%fs"
+#        define STR_SEG "gs"
+#        define STR_LIB_SEG "fs"
 #    else
 #        define SEG_TLS SEG_FS
 #        define ASM_SEG "%fs"
 #        define LIB_SEG_TLS SEG_GS /* libc+loader tls */
 #        define LIB_ASM_SEG "%gs"
+#        define STR_SEG "fs"
+#        define STR_LIB_SEG "gs"
 #    endif
 #elif defined(AARCHXX)
 /* The SEG_TLS is not preserved by all kernels (older 32-bit, or all 64-bit), so we
@@ -97,15 +103,32 @@
  * the DR base.
  */
 #    ifdef X64
-#        define SEG_TLS DR_REG_TPIDRRO_EL0   /* DR_REG_TPIDRURO, but we can't use it */
-#        define LIB_SEG_TLS DR_REG_TPIDR_EL0 /* DR_REG_TPIDRURW, libc+loader tls */
+#        ifdef MACOS
+#            define SEG_TLS DR_REG_TPIDR_EL0       /* cpu number */
+#            define LIB_SEG_TLS DR_REG_TPIDRRO_EL0 /* loader tls */
+#            define STR_SEG "tpidrurw"
+#            define STR_LIB_SEG "tpidruro"
+#        else
+#            define SEG_TLS DR_REG_TPIDRRO_EL0   /* DR_REG_TPIDRURO, but can't use it */
+#            define LIB_SEG_TLS DR_REG_TPIDR_EL0 /* DR_REG_TPIDRURW, libc+loader tls */
+#            define STR_SEG "tpidruro"
+#            define STR_LIB_SEG "tpidrurw"
+#        endif
 #    else
 #        define SEG_TLS                                                     \
             DR_REG_TPIDRURW /* not restored by older kernel => we can't use \
                              */
 #        define LIB_SEG_TLS DR_REG_TPIDRURO /* libc+loader tls */
-#    endif                                  /* 64/32-bit */
-#endif                                      /* X86/ARM */
+#        define STR_SEG "tpidrurw"
+#        define STR_LIB_SEG "tpidruro"
+#    endif /* 64/32-bit */
+#elif defined(RISCV64)
+/* FIXME i#3544: Not used on RISC-V, so set to invalid. Check if this is true. */
+#    define SEG_TLS DR_REG_INVALID
+#    define LIB_SEG_TLS DR_REG_TP
+#    define STR_SEG "<none>"
+#    define STR_LIB_SEG "tp"
+#endif /* X86/ARM */
 
 #define TLS_REG_LIB LIB_SEG_TLS /* TLS reg commonly used by libraries in Linux */
 #define TLS_REG_ALT SEG_TLS     /* spare TLS reg, used by DR in X86 Linux */
@@ -116,6 +139,8 @@
 #    define DR_REG_SYSNUM DR_REG_R7
 #elif defined(AARCH64)
 #    define DR_REG_SYSNUM DR_REG_X8
+#elif defined(RISCV64)
+#    define DR_REG_SYSNUM DR_REG_A7
 #else
 #    error NYI
 #endif
@@ -133,7 +158,7 @@
 #    define DR_TLS_BASE_OFFSET (SEG_TLS_BASE_OFFSET + DR_TLS_BASE_SLOT)
 #endif
 
-#ifdef AARCHXX
+#if defined(AARCHXX) && !defined(MACOS64)
 #    ifdef ANDROID
 /* We have our own slot at the end of our instance of Android's
  * pthread_internal_t. However, its offset varies by Android version, requiring
@@ -165,6 +190,17 @@ extern uint android_tls_base_offs;
  */
 #    define USR_TLS_REG_OPCODE 3
 #    define USR_TLS_COPROC_15 15
+#endif
+
+#ifdef RISCV64
+/* FIXME i#3544: We might need to re-use ARM's approach and store DR TLS in
+ * tcb_head_t::private field: typedef struct
+ *   {
+ *     dtv_t *dtv;
+ *     void *private;
+ *   } tcb_head_t;
+ */
+#    define DR_TLS_BASE_OFFSET IF_X64_ELSE(8, 4) /* skip dtv */
 #endif
 
 #ifdef LINUX
@@ -281,6 +317,10 @@ disable_env(const char *name);
  * section goes -- for cl, order linked seems to do it, but for linux
  * will need a linker script (see unix/os.c for the nspdata problem)
  */
+/* XXX i#5565: Sections are aligned to page-size because DR can enable memory
+ * protection per-page (currently only on Windows). Hard-coded 4K alignment will
+ * lead to issues on systems with larger base pages.
+ */
 #ifdef MACOS
 /* XXX: currently assuming all custom sections are writable and non-executable! */
 #    define DECLARE_DATA_SECTION(name, wx) \
@@ -295,7 +335,11 @@ disable_env(const char *name);
 #        define DECLARE_DATA_SECTION(name, wx)     \
             asm(".section " name ", \"a" wx "\""); \
             asm(".align 12"); /* 2^12 */
-#    endif                    /* X86/ARM */
+#    elif defined(DR_HOST_RISCV64)
+#        define DECLARE_DATA_SECTION(name, wx)     \
+            asm(".section " name ", \"a" wx "\""); \
+            asm(".align 12"); /* 2^12 */
+#    endif                    /* X86/ARM/RISCV64 */
 #endif                        /* MACOS/UNIX */
 
 /* XXX i#465: It's unclear what section we should switch to after our section
@@ -316,6 +360,11 @@ disable_env(const char *name);
             asm(".align 0x1000");               \
             asm(".text");
 #    elif defined(DR_HOST_AARCHXX)
+#        define END_DATA_SECTION_DECLARATIONS() \
+            asm(".section .data");              \
+            asm(".align 12");                   \
+            asm(".text");
+#    elif defined(DR_HOST_RISCV64)
 #        define END_DATA_SECTION_DECLARATIONS() \
             asm(".section .data");              \
             asm(".align 12");                   \
@@ -544,7 +593,7 @@ send_nudge_signal(process_id_t pid, uint action_mask, client_id_t client_id,
 bool
 at_dl_runtime_resolve_ret(dcontext_t *dcontext, app_pc source_fragment, int *ret_imm);
 
-/* rseq.c */
+/* rseq_linux.c */
 #ifdef LINUX
 extern vm_area_vector_t *d_r_rseq_areas;
 
@@ -579,6 +628,9 @@ rseq_shared_fragment_flushtime_update(dcontext_t *dcontext);
 
 void
 rseq_process_native_abort(dcontext_t *dcontext);
+
+void
+rseq_insert_start_label(dcontext_t *dcontext, app_pc tag, instrlist_t *ilist);
 
 #endif
 

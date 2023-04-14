@@ -1,5 +1,5 @@
 /* **********************************************************
- * Copyright (c) 2013-2021 Google, Inc.   All rights reserved.
+ * Copyright (c) 2013-2022 Google, Inc.   All rights reserved.
  * **********************************************************/
 
 /*
@@ -52,9 +52,11 @@
 #ifdef DEBUG
 #    define ASSERT(x, msg) DR_ASSERT_MSG(x, msg)
 #    define LOG(dc, mask, level, ...) dr_log(dc, mask, level, __VA_ARGS__)
+#    define IF_DEBUG(x) x
 #else
 #    define ASSERT(x, msg)            /* nothing */
 #    define LOG(dc, mask, level, ...) /* nothing */
+#    define IF_DEBUG(x)               /* nothing */
 #endif
 
 #ifdef WINDOWS
@@ -478,9 +480,12 @@ drreg_insert_restore_all(void *drcontext, instrlist_t *bb, instr_t *inst,
          /* Writing just a subset needs to combine with the original unwritten */
          (TESTANY(EFLAGS_WRITE_ARITH, instr_get_eflags(inst, DR_QUERY_INCLUDE_ALL)) &&
           aflags != 0 /*0 means everything is dead*/) ||
-         /* Annotation handlers require app values (XXX i#5160: Remove special case). */
+         /* Annotation handlers and rseq mangling require app values.
+          * (XXX i#5160: Refactor drreg vs core to remove special cases?)
+          */
          (instr_is_label(inst) &&
-          (ptr_uint_t)instr_get_note(inst) == DR_NOTE_ANNOTATION) ||
+          ((ptr_uint_t)instr_get_note(inst) == DR_NOTE_ANNOTATION ||
+           (ptr_uint_t)instr_get_note(inst) == DR_NOTE_REG_BARRIER)) ||
          /* DR slots are not guaranteed across app instrs */
          (pt->aflags.slot != MAX_SPILLS &&
           pt->aflags.slot >= (int)ops.num_spill_slots))) {
@@ -520,9 +525,12 @@ drreg_insert_restore_all(void *drcontext, instrlist_t *bb, instr_t *inst,
             regs_restored[GPR_IDX(reg)] = false;
         if (!pt->reg[GPR_IDX(reg)].native) {
             if (force_restore || instr_reads_from_reg(inst, reg, DR_QUERY_INCLUDE_ALL) ||
-                /* Annotations require app values (XXX i#5160: Remove special case). */
+                /* Annotation handlers and rseq mangling require app values.
+                 * (XXX i#5160: Refactor drreg vs core to remove special cases?)
+                 */
                 (instr_is_label(inst) &&
-                 (ptr_uint_t)instr_get_note(inst) == DR_NOTE_ANNOTATION) ||
+                 ((ptr_uint_t)instr_get_note(inst) == DR_NOTE_ANNOTATION ||
+                  (ptr_uint_t)instr_get_note(inst) == DR_NOTE_REG_BARRIER)) ||
                 /* Treat a partial write as a read, to restore rest of reg */
                 (instr_writes_to_reg(inst, reg, DR_QUERY_INCLUDE_ALL) &&
                  !instr_writes_to_exact_reg(inst, reg, DR_QUERY_INCLUDE_ALL)) ||
@@ -1958,6 +1966,36 @@ is_our_spill_or_restore(void *drcontext, instr_t *instr, bool *spill OUT,
     return true;
 }
 
+static inline bool
+is_aflags_spill(instr_t *inst)
+{
+#if defined(X86)
+    return instr_get_opcode(inst) == OP_lahf;
+#elif defined(AARCHXX)
+    return instr_get_opcode(inst) == OP_mrs;
+#elif defined(RISCV64)
+    /* RISC-V does not have any integer arithmetic or compare flag registers. */
+    return false;
+#else
+#    error Unsupported architecture
+#endif
+}
+
+static inline bool
+is_aflags_restore(instr_t *inst)
+{
+#if defined(X86)
+    return instr_get_opcode(inst) == OP_sahf;
+#elif defined(AARCHXX)
+    return instr_get_opcode(inst) == OP_msr;
+#elif defined(RISCV64)
+    /* RISC-V does not have any integer arithmetic or condition flag registers. */
+    return false;
+#else
+#    error Unsupported architecture
+#endif
+}
+
 drreg_status_t
 drreg_is_instr_spill_or_restore(void *drcontext, instr_t *instr, bool *spill OUT,
                                 bool *restore OUT, reg_id_t *reg_spilled OUT)
@@ -2009,7 +2047,8 @@ drreg_event_restore_state_without_ilist(void *drcontext, bool restore_memory,
     reg_id_t aflags_reg = DR_REG_NULL;
     reg_id_t reg;
     instr_t inst;
-    byte *prev_pc, *pc = info->fragment_info.cache_start_pc;
+    IF_DEBUG(byte * prev_pc;)
+    byte *pc = info->fragment_info.cache_start_pc;
     uint offs;
     bool spill;
     uint slot;
@@ -2023,7 +2062,7 @@ drreg_event_restore_state_without_ilist(void *drcontext, bool restore_memory,
     instr_init(drcontext, &inst);
     while (pc < info->raw_mcontext->pc) {
         instr_reset(drcontext, &inst);
-        prev_pc = pc;
+        IF_DEBUG(prev_pc = pc;)
         pc = decode(drcontext, pc, &inst);
         if (is_our_spill_or_restore(drcontext, &inst, &spill, &reg, &slot, &offs)) {
             LOG(drcontext, DR_LOG_ALL, 3,
@@ -2069,19 +2108,15 @@ drreg_event_restore_state_without_ilist(void *drcontext, bool restore_memory,
                         __FUNCTION__, pc);
                 }
             }
-        } else if (instr_get_opcode(&inst) == IF_X86_ELSE(OP_lahf, OP_mrs)) {
+        } else if (is_aflags_spill(&inst)) {
             /* TODO i#4937: Unfortunately, without the extra metadata provided by the
              * faulting fragment ilist, we cannot determine whether this spill was a tool
              * aflags spill or app aflags spill. We assume the latter and update our
              * book-keeping.
              */
             aflags_reg = IF_X86_ELSE(DR_REG_XAX, opnd_get_reg(instr_get_dst(&inst, 0)));
-        } else if (aflags_reg != DR_REG_NULL &&
-                   instr_get_opcode(&inst) ==
-                       IF_X86_ELSE(OP_sahf,
-                                   OP_msr &&
-                                       opnd_get_reg(instr_get_src(&inst, 0)) ==
-                                           aflags_reg)) {
+        } else if (aflags_reg != DR_REG_NULL && is_aflags_restore(&inst) &&
+                   opnd_get_reg(instr_get_src(&inst, 0)) == aflags_reg) {
             aflags_reg = DR_REG_NULL;
         } else if (aflags_reg != DR_REG_NULL) {
             /* If the reg storing aflags gets written to before being spilled to a slot,
@@ -2100,16 +2135,18 @@ drreg_event_restore_state_without_ilist(void *drcontext, bool restore_memory,
         }
     }
     instr_free(drcontext, &inst);
+/* RISC-V does not have any aflags to restore */
+#if !defined(RISCV64)
     if (aflags_slot < MAX_SPILLS || aflags_reg != DR_REG_NULL) {
         reg_t newval = info->mcontext->xflags;
         reg_t val;
         if (aflags_reg != DR_REG_NULL) {
-#ifdef X86
+#    ifdef X86
             ASSERT(aflags_reg == DR_REG_XAX, "x86 aflags can only be in xax");
             val = info->mcontext->xax;
-#else
+#    else
             val = *(reg_t *)(&info->mcontext->r0 + (aflags_reg - DR_REG_R0));
-#endif
+#    endif
         } else {
             val = get_spilled_value(drcontext, aflags_slot);
         }
@@ -2118,6 +2155,7 @@ drreg_event_restore_state_without_ilist(void *drcontext, bool restore_memory,
             __FUNCTION__, info->mcontext->xflags, newval);
         info->mcontext->xflags = newval;
     }
+#endif
     for (reg = DR_REG_START_GPR; reg <= DR_REG_STOP_GPR; reg++) {
         if (spilled_to[GPR_IDX(reg)] < MAX_SPILLS) {
             reg_t val = get_spilled_value(drcontext, spilled_to[GPR_IDX(reg)]);
@@ -2275,7 +2313,7 @@ drreg_event_restore_state_with_ilist(void *drcontext, bool restore_memory,
                             get_register_name(reg), slot);
                     }
                 }
-            } else if (instr_get_opcode(inst) == IF_X86_ELSE(OP_sahf, OP_msr)) {
+            } else if (is_aflags_restore(inst)) {
                 if (aflags_spill_reg == DR_REG_NULL &&
                     spill_slot[GPR_IDX(AFLAGS_ALIAS_REG)] == MAX_SPILLS) {
                     /* Found a restore for app aflags from reg. */
@@ -2288,8 +2326,7 @@ drreg_event_restore_state_with_ilist(void *drcontext, bool restore_memory,
                     tool_aflags_spill_reg =
                         IF_X86_ELSE(DR_REG_XAX, opnd_get_reg(instr_get_src(inst, 0)));
                 }
-            } else if (instr_get_opcode(inst) == IF_X86_ELSE(OP_lahf, OP_mrs)) {
-
+            } else if (is_aflags_spill(inst)) {
                 if (aflags_spill_reg ==
                     IF_X86_ELSE(DR_REG_XAX, opnd_get_reg(instr_get_dst(inst, 0)))) {
                     /* Found the matching app aflags spill for the previously recorded
@@ -2323,18 +2360,20 @@ drreg_event_restore_state_with_ilist(void *drcontext, bool restore_memory,
             }
         }
     }
+/* RISC-V does not have any aflags to restore */
+#if !defined(RISCV64)
     if (aflags_spill_reg != DR_REG_NULL ||
         spill_slot[GPR_IDX(AFLAGS_ALIAS_REG)] != MAX_SPILLS) {
         reg_t newval = info->mcontext->xflags;
         reg_t val;
         slot = spill_slot[GPR_IDX(AFLAGS_ALIAS_REG)];
         if (aflags_spill_reg != DR_REG_NULL) {
-#ifdef X86
+#    ifdef X86
             ASSERT(aflags_spill_reg == DR_REG_XAX, "x86 aflags can only be in xax");
             val = info->mcontext->xax;
-#else
+#    else
             val = *(reg_t *)(&info->mcontext->r0 + (aflags_spill_reg - DR_REG_R0));
-#endif
+#    endif
             newval = dr_merge_arith_flags(newval, val);
             LOG(drcontext, DR_LOG_ALL, 3,
                 "%s: restoring aflags from reg %s " PFX " to " PFX "\n", __FUNCTION__,
@@ -2348,6 +2387,7 @@ drreg_event_restore_state_with_ilist(void *drcontext, bool restore_memory,
         }
         info->mcontext->xflags = newval;
     }
+#endif
     for (reg = DR_REG_START_GPR; reg <= DR_REG_STOP_GPR; reg++) {
         if (spill_slot[GPR_IDX(reg)] != MAX_SPILLS) {
             slot = spill_slot[GPR_IDX(reg)];

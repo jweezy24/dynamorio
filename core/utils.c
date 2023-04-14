@@ -1779,6 +1779,9 @@ print_file(file_t f, const char *fmt, ...)
  * Returns false if there was not room for the string plus a null,
  * but still prints the maximum that will fit plus a null.
  */
+/* XXX: This is duplicated in ir/decodlib.c's print_to_buffer.
+ * Could we move this into io.c to share it with decodelib?
+ */
 static bool
 vprint_to_buffer(char *buf, size_t bufsz, size_t *sofar INOUT, const char *fmt,
                  va_list ap)
@@ -1791,7 +1794,13 @@ vprint_to_buffer(char *buf, size_t bufsz, size_t *sofar INOUT, const char *fmt,
     len = d_r_vsnprintf(buf + *sofar, bufsz - *sofar, fmt, ap);
     /* we support appending an empty string (len==0) */
     ok = (len >= 0 && len < (ssize_t)(bufsz - *sofar));
-    *sofar += (len == -1 ? (bufsz - *sofar - 1) : (len < 0 ? 0 : len));
+    /* If the written chars filled up the max size exactly, that max size is returned
+     * without a final null by d_r_vsnprintf().  Since we guarantee a null, we have
+     * to clobber a char, just like for -1 being returned when the written chars do
+     * not all fit.
+     */
+    *sofar += (len == -1 || len == (ssize_t)(bufsz - *sofar) ? (bufsz - *sofar - 1)
+                                                             : (len < 0 ? 0 : len));
     /* be paranoid: though usually many calls in a row and could delay until end */
     buf[bufsz - 1] = '\0';
     return ok;
@@ -1864,12 +1873,12 @@ d_r_notify(syslog_event_type_t priority, bool internal, bool synch,
            const char *fmt, ...)
 {
     char msgbuf[MAX_LOG_LENGTH];
-    int size;
     va_list ap;
     va_start(ap, fmt);
-    /* FIXME : the vsnprintf call is not needed in the most common case where
-     * we are going to just os_syslog, but it gets pretty ugly to do that */
-    size = vsnprintf(msgbuf, sizeof(msgbuf), fmt, ap);
+    /* XXX: the vsnprintf call is not needed in the most common case where
+     * we are going to just os_syslog, but it gets pretty ugly to do that
+     */
+    vsnprintf(msgbuf, sizeof(msgbuf), fmt, ap);
     NULL_TERMINATE_BUFFER(msgbuf); /* always NULL terminate */
     /* not a good idea to assert here since we'll just die and lose original message,
      * so we don't check size return value and just go ahead and truncate
@@ -2656,7 +2665,7 @@ create_log_dir(int dir_type)
 {
 #ifdef UNIX
     char *pre_execve = getenv(DYNAMORIO_VAR_EXECVE_LOGDIR);
-    bool sharing_logdir = false;
+    DEBUG_DECLARE(bool sharing_logdir = false;)
 #endif
     /* synchronize */
     acquire_recursive_lock(&logdir_mutex);
@@ -2670,7 +2679,7 @@ create_log_dir(int dir_type)
         if (IS_STRING_OPTION_EMPTY(logdir) &&
             (get_config_val_ex(DYNAMORIO_VAR_LOGDIR, NULL, &is_env) == NULL || is_env)) {
             /* use same dir as pre-execve! */
-            sharing_logdir = true;
+            DODEBUG(sharing_logdir = true;);
             strncpy(logdir, pre_execve, BUFFER_SIZE_ELEMENTS(logdir));
             NULL_TERMINATE_BUFFER(logdir); /* if max no null */
             logdir_initialized = true;

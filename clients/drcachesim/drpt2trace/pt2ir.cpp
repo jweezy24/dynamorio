@@ -34,7 +34,6 @@
 #include <stdlib.h>
 #include <iostream>
 #include <string.h>
-#include <inttypes.h>
 #include <errno.h>
 #include <fstream>
 
@@ -134,7 +133,7 @@ pt2ir_t::init(IN pt2ir_config_t &pt2ir_config)
         sb_primary_config.primary = 1;
         sb_primary_config.begin = (size_t)0;
         sb_primary_config.end = (size_t)0;
-        if (!alloc_sb_pevent_decoder(&sb_primary_config)) {
+        if (!alloc_sb_pevent_decoder(sb_primary_config)) {
             ERRMSG("Failed to allocate primary sideband perf event decoder.\n");
             return false;
         }
@@ -148,7 +147,7 @@ pt2ir_t::init(IN pt2ir_config_t &pt2ir_config)
             sb_secondary_config.primary = 0;
             sb_secondary_config.begin = (size_t)0;
             sb_secondary_config.end = (size_t)0;
-            if (!alloc_sb_pevent_decoder(&sb_secondary_config)) {
+            if (!alloc_sb_pevent_decoder(sb_secondary_config)) {
                 ERRMSG("Failed to allocate secondary sideband perf event decoder.\n");
                 return false;
             }
@@ -157,7 +156,7 @@ pt2ir_t::init(IN pt2ir_config_t &pt2ir_config)
 
     /* Load kcore to sideband kernel image cache. */
     if (!pt2ir_config.kcore_path.empty()) {
-        if (!load_kernel_image(pt2ir_config.kcore_path)) {
+        if (!load_kcore(pt2ir_config.kcore_path)) {
             ERRMSG("Failed to load kernel image: %s\n", pt2ir_config.kcore_path.c_str());
             return false;
         }
@@ -197,12 +196,31 @@ pt2ir_t::init(IN pt2ir_config_t &pt2ir_config)
         return false;
     }
 
+    if (!pt2ir_config.elf_file_path.empty()) {
+        errcode =
+            load_elf(pt_iscache_, pt_insn_get_image(pt_instr_decoder_),
+                     pt2ir_config.elf_file_path.c_str(), pt2ir_config.elf_base, "", 0);
+        if (errcode < 0) {
+            ERRMSG("Failed to load ELF file: %s.\n", pt_errstr(pt_errcode(errcode)));
+            return false;
+        }
+    }
+
     return true;
 }
 
 pt2ir_convert_status_t
-pt2ir_t::convert()
+pt2ir_t::convert(OUT instrlist_autoclean_t &ilist)
 {
+    /* Initializes an empty instruction list to store all DynamoRIO's IR list converted
+     * from PT IR.
+     */
+    if (ilist.data == nullptr) {
+        ilist.data = instrlist_create(GLOBAL_DCONTEXT);
+    } else {
+        instrlist_clear(GLOBAL_DCONTEXT, ilist.data);
+    }
+
     /* PT raw data consists of many packets. And PT trace data is surrounded by Packet
      * Stream Boundary. So, in the outermost loop, this function first finds the PSB. Then
      * it decodes the trace data.
@@ -228,6 +246,7 @@ pt2ir_t::convert()
             if (status == -pte_eos)
                 break;
             dx_decoding_error(status, "sync error", insn.ip);
+            instrlist_clear(GLOBAL_DCONTEXT, ilist.data);
             return PT2IR_CONV_ERROR_SYNC_PACKET;
         }
 
@@ -248,6 +267,7 @@ pt2ir_t::convert()
                 if (nextstatus < 0) {
                     errcode = nextstatus;
                     dx_decoding_error(errcode, "get pending event error", insn.ip);
+                    instrlist_clear(GLOBAL_DCONTEXT, ilist.data);
                     return PT2IR_CONV_ERROR_GET_PENDING_EVENT;
                 }
 
@@ -259,6 +279,7 @@ pt2ir_t::convert()
                     pt_sb_event(pt_sb_session_, &image, &event, sizeof(event), stdout, 0);
                 if (errcode < 0) {
                     dx_decoding_error(errcode, "handle sideband event error", insn.ip);
+                    instrlist_clear(GLOBAL_DCONTEXT, ilist.data);
                     return PT2IR_CONV_ERROR_HANDLE_SIDEBAND_EVENT;
                 }
 
@@ -271,6 +292,7 @@ pt2ir_t::convert()
                 errcode = pt_insn_set_image(pt_instr_decoder_, image);
                 if (errcode < 0) {
                     dx_decoding_error(errcode, "set image error", insn.ip);
+                    instrlist_clear(GLOBAL_DCONTEXT, ilist.data);
                     return PT2IR_CONV_ERROR_SET_IMAGE;
                 }
             }
@@ -281,31 +303,42 @@ pt2ir_t::convert()
             status = pt_insn_next(pt_instr_decoder_, &insn, sizeof(insn));
             if (status < 0) {
                 dx_decoding_error(status, "get next instruction error", insn.ip);
+                instrlist_clear(GLOBAL_DCONTEXT, ilist.data);
                 return PT2IR_CONV_ERROR_DECODE_NEXT_INSTR;
             }
 
-            pt_insn_list_.push_back(insn);
-
-            /* TODO i#5505: Use drdecode to decode insn(pt_insn) to instr_t. */
+            /* Use drdecode to decode insn(pt_insn) to instr_t. */
+            instr_t *instr = instr_create(GLOBAL_DCONTEXT);
+            instr_init(GLOBAL_DCONTEXT, instr);
+            instr_set_isa_mode(instr,
+                               insn.mode == ptem_32bit ? DR_ISA_IA32 : DR_ISA_AMD64);
+            decode(GLOBAL_DCONTEXT, insn.raw, instr);
+            instr_set_translation(instr, (app_pc)insn.ip);
+            instr_allocate_raw_bits(GLOBAL_DCONTEXT, instr, insn.size);
+            /* TODO i#2103: Currently, the PT raw data may contain 'STAC' and 'CLAC'
+             * instructions that are not supported by Dynamorio.
+             */
+            if (!instr_valid(instr)) {
+                /* The decode() function will not correctly identify the raw bits for
+                 * invalid instruction. So we need to set the raw bits of instr manually.
+                 */
+                instr_free_raw_bits(GLOBAL_DCONTEXT, instr);
+                instr_set_raw_bits(instr, insn.raw, insn.size);
+                instr_allocate_raw_bits(GLOBAL_DCONTEXT, instr, insn.size);
+#ifdef DEBUG
+                /* Print the invalid instruction‘s PC and raw bytes in DEBUG mode. */
+                dr_fprintf(STDOUT, "<INVALID> <raw " PFX "-" PFX " ==", (app_pc)insn.ip,
+                           (app_pc)insn.ip + insn.size);
+                for (int i = 0; i < insn.size; i++) {
+                    dr_fprintf(STDOUT, " %02x", insn.raw[i]);
+                }
+                dr_fprintf(STDOUT, ">\n");
+#endif
+            }
+            instrlist_append(ilist.data, instr);
         }
     }
     return PT2IR_CONV_SUCCESS;
-}
-
-uint64_t
-pt2ir_t::get_instr_count()
-{
-    return pt_insn_list_.size();
-}
-
-void
-pt2ir_t::print_instrs_to_stdout()
-{
-    void *dcontext = GLOBAL_DCONTEXT;
-    for (auto pt_instr : pt_insn_list_) {
-        disassemble_with_info(dcontext, pt_instr.raw, STDOUT, /*show_pc=*/false,
-                              /*show_bytes=*/false);
-    }
 }
 
 bool
@@ -344,9 +377,8 @@ pt2ir_t::load_pt_raw_file(IN std::string &path)
 }
 
 bool
-pt2ir_t::load_kernel_image(IN std::string &path)
+pt2ir_t::load_kcore(IN std::string &path)
 {
-    struct pt_image *kimage = pt_sb_kernel_image(pt_sb_session_);
     /* Load all ELF sections in kcore to the shared image cache.
      * XXX: load_elf() is implemented in libipt's client ptxed. Currently we directly use
      * it. We may need to implement a c++ version in our client.
@@ -362,9 +394,9 @@ pt2ir_t::load_kernel_image(IN std::string &path)
 }
 
 bool
-pt2ir_t::alloc_sb_pevent_decoder(IN struct pt_sb_pevent_config *config)
+pt2ir_t::alloc_sb_pevent_decoder(IN struct pt_sb_pevent_config &config)
 {
-    int errcode = pt_sb_alloc_pevent_decoder(pt_sb_session_, config);
+    int errcode = pt_sb_alloc_pevent_decoder(pt_sb_session_, &config);
     if (errcode < 0) {
         ERRMSG("Failed to allocate sideband perf event decoder: %s.\n",
                pt_errstr(pt_errcode(errcode)));
@@ -385,9 +417,10 @@ pt2ir_t::dx_decoding_error(IN int errcode, IN const char *errtype, IN uint64_t i
     err = pt_insn_get_offset(pt_instr_decoder_, &pos);
     if (err < 0) {
         ERRMSG("Could not determine offset: %s\n", pt_errstr(pt_errcode(err)));
-        ERRMSG("[?, %" PRIx64 "] %s: %s\n", ip, errtype, pt_errstr(pt_errcode(errcode)));
-    } else {
-        ERRMSG("[%" PRIx64 ", IP:%" PRIx64 "] %s: %s\n", pos, ip, errtype,
+        ERRMSG("[?, " HEX64_FORMAT_STRING "] %s: %s\n", ip, errtype,
                pt_errstr(pt_errcode(errcode)));
+    } else {
+        ERRMSG("[" HEX64_FORMAT_STRING ", IP:" HEX64_FORMAT_STRING "] %s: %s\n", pos, ip,
+               errtype, pt_errstr(pt_errcode(errcode)));
     }
 }

@@ -1,5 +1,5 @@
 /* ******************************************************************************
- * Copyright (c) 2010-2022 Google, Inc.  All rights reserved.
+ * Copyright (c) 2010-2023 Google, Inc.  All rights reserved.
  * Copyright (c) 2011 Massachusetts Institute of Technology  All rights reserved.
  * Copyright (c) 2008-2010 VMware, Inc.  All rights reserved.
  * ******************************************************************************/
@@ -128,6 +128,40 @@ The changes between version \DR_VERSION and 9.0.1 include the following compatib
 changes:
  - Eliminated the -skip_syscall option to drrun and drinject, which is now always
    on by default.
+ - Changed the drcachesim -use_physical option to not modify the regular trace
+   entry virtual addresses but to instead insert metadata containing translation
+   information for converting virtual to physical addresses.
+ - Changed the layout of the DR_FAST_IR struct to add an element size property
+   that supports more information about vectors. This changes the method of accessing
+   the register in the structure from struct.value.reg to
+   struct.value.reg_and_element_size.reg. The element size can be accessed directly
+   via struct.value.reg_and_element_size.element_size.
+ - Changed the size of the #instr_t structure by appending a field which is used
+   for relative offsets while encoding.  The note field is no longer modified
+   during encoding.
+ - Reduced the value of #DR_NOTE_FIRST_RESERVED.  This is not expected to cause
+   problems unless clients are directly choosing high note values without using
+   drmgr_reserve_note_range().
+ - Changed the values of the AArch64 DR_REG_Z* constants so that Z registers can be
+   used in base+disp operands in SVE scatter/gather instructions. This breaks binary
+   compatibility for clients built against an older version of opnd_api.h, but source
+   code compatibility is unchanged.
+ - Removed the drcachesim external iterator analyzer interface.  Users should instead
+   use the new #dynamorio::drmemtrace::scheduler_tmpl_t interface for direct control
+   over iteration.  See \ref sec_drcachesim_sched for example code.
+ - Refactored the drmemtrace reader and file reader classes to better fit the
+   new scheduler model: now each reader owns just one single stream of records
+   with all multi-stream interleaving owned by the scheduler.
+ - Replaced the AArch64 OP_reta with OP_retaa and OP_retab. "reta" is not a real
+   AArch64 instruction and "reta" entries in the AArch64 codec were being used to
+   decode "retaa" and "retab". These instructions will now encode and decode correctly
+   as "retaa" and "retab".
+ - Added a #DR_XFER_RSEQ_ABORT event for a signal generated during an rseq region.
+ - Changed the interrupted PC for #DR_XFER_RSEQ_ABORT for native execution aborts to be
+   the abort handler (a signal during the instrumented execution will continue to have
+   the actual interrupted PC); changed the interrupted PC for #DR_XFER_SIGNAL_DELIVERY
+   for a signal generated during an rseq region to be the abort handler, matching the
+   kernel behavior.
 
 Further non-compatibility-affecting changes include:
  - Added AArchXX support for attaching to a running process.
@@ -149,6 +183,61 @@ Further non-compatibility-affecting changes include:
    dr_hashtable_destroy(), dr_hashtable_clear(), dr_hashtable_lookup(),
    dr_hashtable_add(), dr_hashtable_remove().
  - Added a new #TRACE_MARKER_TYPE_PAGE_SIZE record to drcachesim offline traces.
+ - Added new drmemtrace options -L0I_filter and -L0D_filter that allow enabling
+   online filtering for only instruction or only data entries respectively. The
+   old option -L0_filter is deprecated but still supported for backward
+   compatibility. It simply sets both the new options.
+ - Added a new DR extension, namely "drpttracer", which provides clients with tracing
+   functionality via Intel's PT instruction tracing feature. This feature is still
+   experimental and available only on Intel processors.
+ - Added a new drmemtrace option -enable_kernel_tracing that allows recording each
+   syscall's Kernel PT and writes every syscall's PT and metadata to files in
+   -outdir/kernel.raw/ for later offline analysis. This feature is still experimental
+   and available only on Intel processors that support the Intel@ Processor Trace
+   feature.
+ - Added drmemtrace_get_encoding_path().
+ - Added preliminary support for generated code to drmemtrace.
+ - Changed the default drmemtrace offline file format from .gz to .zip and
+   added the option -chunk_instr_count to control the split of a file within
+   the .zip, which sets the granularity of a fast seek.
+ - Added dr_register_post_attach_event(), dr_unregister_post_attach_event(),
+   dr_register_pre_detach_event(), and dr_unregister_pre_detach_event().
+ - Added instruction encodings to drmemtrace offline traces.
+ - Added drmemtrace_replace_file_ops_ex().
+ - Added -align_endpoints to drmemtrace to avoid uneven attach/detach periods.
+ - Added a method of representing vector registers with element sizes.
+   They can be created with opnd_create_reg_element_vector(), detected with
+   opnd_is_element_vector_reg() and have their element size retrieved by
+   opnd_get_vector_element_size().
+ - Deprecated the drmemtrace analysis tool functions initialize() and
+   parallel_shard_init(), replacing them with initialize_stream() and
+   parallel_shard_init_stream().  The old versions will continue to work.
+   The stream interface passed to analysis tools provides tools with the
+   record and instruction ordinals along with the values of top-level
+   headers.
+ - Added #record_analyzer_t and #record_analysis_tool_t for analyzing the
+   sequence of #trace_entry_t exactly as present in a stored offline trace.
+ - Added opnd_size_to_shift_amount() and opnd_create_base_disp_shift_aarch64()
+   for explicitly specifying shift amounts in the creation of operands for
+   AArch64 memory addresses.
+ - Added opnd_create_increment_reg() to create a register from an existing
+   register whose register number is incremented by some amount, wrapping
+   at the max register number for that register.
+ - Added opnd_create_vector_base_disp_aarch64() and reg_is_z() for creating
+   memory address operands that use SVE Z registers with a specified element
+   size.
+ - Added a new #dynamorio::drmemtrace::scheduler_tmpl_t interface providing scheduling
+   of drmemtrace offline files onto configurable output streams, meant for use by
+   microarchitectural simulators.
+ - Added a #memtrace_stream_t interface for drmemtrace analysis tools to
+   query key attributes of each input trace.
+ - Added instr_create_1dst_6src() convenience function that returns an instr_t
+   with one destination and six sources.
+ - Added a new label to help in handling "rseq" (Linux restartable sequence) regions:
+   #DR_NOTE_RSEQ_ENTRY.
+
+**************************************************
+<hr>
 
 The changes between version 9.0.1 and 9.0.0 include the following compatibility
 changes:
@@ -173,6 +262,9 @@ Further non-compatibility-affecting changes include:
    bitwidth path, when configuring target processes.
  - Added -tool_dir drrun/drconfig parameter to control where to look for tool
    config files.
+
+**************************************************
+<hr>
 
 The changes between version 9.0.0 and 8.0.0 include the following compatibility
 changes:
@@ -606,7 +698,7 @@ Further non-compatibility-affecting changes include:
      #raw2trace_t for writing trace metadata: process/thread ids, timestamps, etc.
    - Added #trace_metadata_reader_t, a set of utilities for checking and validating
      thread start successions of offline entries in a raw data file.
-   - Added #trace_converter_t, an extensibility mechanism for raw trace conversion.
+   - Added trace_converter_t, an extensibility mechanism for raw trace conversion.
  - Added drmemtrace_get_timestamp_from_offline_trace(), an API for fetching the timestamp
    from the beginning of a raw trace bundle (regardless of whether it is a thread start
    or just a subsequent bundle).

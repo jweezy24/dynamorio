@@ -1,5 +1,5 @@
 /* **********************************************************
- * Copyright (c) 2011-2021 Google, Inc.  All rights reserved.
+ * Copyright (c) 2011-2023 Google, Inc.  All rights reserved.
  * Copyright (c) 2007-2008 VMware, Inc.  All rights reserved.
  * **********************************************************/
 
@@ -2707,6 +2707,87 @@ test_simd_zeroes_upper(void *dc)
     instr_destroy(dc, instr);
 }
 
+static void
+test_evex_compressed_disp_with_segment_prefix(void *dc)
+{
+#ifdef X64
+    byte *pc;
+    const byte b[] = { 0x2e, 0x67, 0x62, 0x01, 0xc5, 0x00, 0xc4, 0x62, 0x21, 0x00 };
+    char dbuf[512];
+    int len;
+
+    pc =
+        disassemble_to_buffer(dc, (byte *)b, (byte *)b, false /*no pc*/,
+                              false /*no bytes*/, dbuf, BUFFER_SIZE_ELEMENTS(dbuf), &len);
+    ASSERT(pc == &b[0] + sizeof(b));
+    ASSERT(
+        strcmp(
+            dbuf,
+            "addr32 vpinsrw %xmm23[14byte] %cs:0x42(%r10d)[2byte] $0x00 -> %xmm28\n") ==
+        0);
+#endif
+}
+
+static void
+test_extra_leading_prefixes(void *dc)
+{
+#ifdef X64
+    byte *pc;
+    const byte b1[] = { 0xf3, 0xf2, 0x4b, 0x0f, 0x70, 0x76, 0x00, 0xff };
+    const byte b2[] = { 0xf3, 0xf2, 0x0f, 0xbc, 0xf2 };
+    char dbuf[512];
+    int len;
+
+    pc =
+        disassemble_to_buffer(dc, (byte *)b1, (byte *)b1, false /*no pc*/,
+                              false /*no bytes*/, dbuf, BUFFER_SIZE_ELEMENTS(dbuf), &len);
+    ASSERT(pc == &b1[0] + sizeof(b1));
+    ASSERT(strcmp(dbuf, "pshuflw 0x00(%r14)[16byte] $0xff -> %xmm6\n") == 0);
+
+    pc =
+        disassemble_to_buffer(dc, (byte *)b2, (byte *)b2, false /*no pc*/,
+                              false /*no bytes*/, dbuf, BUFFER_SIZE_ELEMENTS(dbuf), &len);
+    ASSERT(pc == &b2[0] + sizeof(b2));
+    ASSERT(strcmp(dbuf, "bsf    %edx -> %esi\n") == 0);
+#endif
+}
+
+static void
+test_disasm_to_buffer(void *dc)
+{
+    /* Test disassemble_to_buffer() corner cases. */
+    byte *pc;
+    byte b[] = { 0x90 };
+    char dbuf[512];
+    const char *expect = "nop\n";
+    size_t expect_len = strlen(expect);
+    int len;
+    /* Test plenty of room. */
+    pc = disassemble_to_buffer(dc, b, b, false /*no pc*/, false /*no bytes*/, dbuf,
+                               expect_len + 10, &len);
+    ASSERT(pc == b + 1);
+    ASSERT(strcmp(dbuf, expect) == 0);
+    ASSERT(len == expect_len);
+    /* Test just enough room. */
+    pc = disassemble_to_buffer(dc, b, b, false /*no pc*/, false /*no bytes*/, dbuf,
+                               expect_len + 1 /*null*/, &len);
+    ASSERT(pc == b + 1);
+    ASSERT(strcmp(dbuf, expect) == 0);
+    ASSERT(len == expect_len);
+    /* Test not enough room for null. */
+    pc = disassemble_to_buffer(dc, b, b, false /*no pc*/, false /*no bytes*/, dbuf,
+                               expect_len, &len);
+    ASSERT(pc == b + 1);
+    ASSERT(strncmp(dbuf, expect, len) == 0);
+    ASSERT(len == expect_len - 1);
+    /* Test not enough room for full string. */
+    pc = disassemble_to_buffer(dc, b, b, false /*no pc*/, false /*no bytes*/, dbuf,
+                               expect_len - 1, &len);
+    ASSERT(pc == b + 1);
+    ASSERT(strncmp(dbuf, expect, len) == 0);
+    ASSERT(len == expect_len - 2);
+}
+
 int
 main(int argc, char *argv[])
 {
@@ -2793,6 +2874,12 @@ main(int argc, char *argv[])
     test_opnd(dcontext);
 
     test_simd_zeroes_upper(dcontext);
+
+    test_evex_compressed_disp_with_segment_prefix(dcontext);
+
+    test_extra_leading_prefixes(dcontext);
+
+    test_disasm_to_buffer(dcontext);
 
 #ifndef STANDALONE_DECODER /* speed up compilation */
     test_all_opcodes_2_avx512_vex(dcontext);

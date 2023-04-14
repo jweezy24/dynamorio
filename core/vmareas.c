@@ -1,5 +1,5 @@
 /* **********************************************************
- * Copyright (c) 2010-2022 Google, Inc.  All rights reserved.
+ * Copyright (c) 2010-2023 Google, Inc.  All rights reserved.
  * Copyright (c) 2002-2010 VMware, Inc.  All rights reserved.
  * **********************************************************/
 
@@ -751,8 +751,8 @@ print_vm_area(vm_area_vector_t *v, vm_area_t *area, file_t outf, const char *pre
             /* avoid rank order violation */
             IF_NO_MEMQUERY(v == all_memory_areas ? NULL :)
             /* i#1649: avoid rank order for dynamo_areas and for other vectors. */
-            ((v == dynamo_areas || v == fcache_unit_areas ||
-              v == loaded_module_areas IF_LINUX(|| v == d_r_rseq_areas))
+            ((v == dynamo_areas || v == fcache_unit_areas || v == loaded_module_areas ||
+              v == modlist_areas IF_LINUX(|| v == d_r_rseq_areas))
                  ? NULL
                  : get_module_base(area->start));
         if (modbase != NULL &&
@@ -3047,7 +3047,6 @@ get_coarse_info_internal(app_pc addr, bool init, bool have_shvm_lock)
     vm_area_t area_copy = {
         0,
     };
-    bool is_coarse = false;
     bool add_to_shared = false;
     bool reset_unit = false;
     /* FIXME perf opt: have a last_area */
@@ -3057,7 +3056,7 @@ get_coarse_info_internal(app_pc addr, bool init, bool have_shvm_lock)
         ASSERT(area != NULL);
         /* The custom field is initialized to 0 in add_vm_area */
         coarse = (coarse_info_t *)area->custom.client;
-        is_coarse = TEST(FRAG_COARSE_GRAIN, area->frag_flags);
+        DEBUG_DECLARE(bool is_coarse = TEST(FRAG_COARSE_GRAIN, area->frag_flags);)
         /* We always create coarse_info_t up front in add_executable_vm_area */
         ASSERT((is_coarse && coarse != NULL) || (!is_coarse && coarse == NULL));
         if (init && coarse != NULL && TEST(PERSCACHE_CODE_INVALID, coarse->flags)) {
@@ -3228,10 +3227,9 @@ app_pc
 is_executable_area_writable_overlap(app_pc start, app_pc end)
 {
     app_pc match_start = NULL;
-    bool writable;
     d_r_read_lock(&executable_areas->lock);
-    writable = executable_areas_match_flags(start, end, NULL, &match_start,
-                                            false /* EXISTS */, VM_MADE_READONLY, 0);
+    executable_areas_match_flags(start, end, NULL, &match_start, false /* EXISTS */,
+                                 VM_MADE_READONLY, 0);
     d_r_read_unlock(&executable_areas->lock);
     return match_start;
 }
@@ -4842,7 +4840,7 @@ check_origins_bb_pattern(dcontext_t *dcontext, app_pc addr, app_pc *base, size_t
 
 #    ifndef X86
     /* FIXME: move the x86-specific analysis to an arch/ file! */
-    ASSERT_NOT_IMPLEMENTED();
+    ASSERT_NOT_IMPLEMENTED(false);
 #    endif
 
 #    ifdef UNIX
@@ -6466,7 +6464,9 @@ app_memory_protection_change_internal(dcontext_t *dcontext, bool update_areas,
         LOG(THREAD, LOG_VMAREAS, 1,
             "patch proof module " PFX "-" PFX " modified %s, by %s,%s=>%s\n", base,
             base + size, patching_code ? "code!" : "data --ok",
-            loader ? "loader --ok" : patching_code ? "hooker!" : "loader or hooker",
+            loader              ? "loader --ok"
+                : patching_code ? "hooker!"
+                                : "loader or hooker",
             patching_IAT ? "IAT hooker" : "patching!",
             patch_proof_overlap ? "SQUASH" : "allow");
         /* curiosly the loader modifies the .reloc section of Dell\QuickSet\dadkeyb.dll */
@@ -7377,7 +7377,9 @@ check_thread_vm_area(dcontext_t *dcontext, app_pc pc, app_pc tag, void **vmlist,
     uint frag_flags = 0;
     uint vm_flags = 0;
     bool ok;
+#ifdef PROGRAM_SHEPHERDING
     bool shared_to_private = false;
+#endif
     /* used for new area */
     app_pc base_pc = 0;
     size_t size = 0; /* set only for unknown areas */
@@ -7431,8 +7433,10 @@ check_thread_vm_area(dcontext_t *dcontext, app_pc pc, app_pc tag, void **vmlist,
     } else {
         DODEBUG({ new_area_prefix = "new vm area for thread: "; });
         data = (thread_data_t *)dcontext->vm_areas_field;
+#ifdef PROGRAM_SHEPHERDING
         if (DYNAMO_OPTION(shared_bbs) && TEST(FRAG_SHARED, *flags))
             shared_to_private = true;
+#endif
     }
 
     LOG(THREAD, LOG_INTERP | LOG_VMAREAS, 4, "check_thread_vm_area: pc = " PFX "\n", pc);
@@ -8256,11 +8260,9 @@ check_thread_vm_area(dcontext_t *dcontext, app_pc pc, app_pc tag, void **vmlist,
         if (!vmvector_empty(d_r_rseq_areas)) {
             /* XXX i#3798: While for core operation we do not need to end a block at
              * an rseq endpoint, we need clients to treat the endpoint as a barrier and
-             * restore app state.  drreg today treats a block end as a barrier.  If
-             * drreg adds optimizations that cross blocks (such as in traces), we may
-             * need to add some other feature here: a fake app cti?  That affects
-             * clients measuring app behavior, though with rseq fidelity is already not
-             * 100%.  Similarly, we don't really need to not have a block span the start
+             * restore app state (which we do have DR_NOTE_REG_BARRIER for) and we
+             * prefer to simplify the block as much as we can.
+             * Similarly, we don't really need to not have a block span the start
              * of an rseq region.  But, we need to save app values at the start, which
              * is best done prior to drreg storing them elsewhere; plus, it makes it
              * easier to turn on full_decode for simpler mangling.
@@ -8271,6 +8273,8 @@ check_thread_vm_area(dcontext_t *dcontext, app_pc pc, app_pc tag, void **vmlist,
                                      NULL)) {
                 if (rseq_start > tag)
                     entered_rseq = true;
+                else if (tag == rseq_start)
+                    *flags |= FRAG_STARTS_RSEQ_REGION;
             } else {
                 app_pc prev_end;
                 if (vmvector_lookup_prev_next(d_r_rseq_areas, pc, NULL, &prev_end,
@@ -8294,6 +8298,8 @@ check_thread_vm_area(dcontext_t *dcontext, app_pc pc, app_pc tag, void **vmlist,
             if (xfer && (entered_rseq || exited_rseq || pc == next_boundary)) {
                 LOG(THREAD, LOG_VMAREAS | LOG_INTERP, 3,
                     "Stopping bb at rseq boundary " PFX "\n", pc);
+                if (exited_rseq)
+                    *flags |= FRAG_HAS_RSEQ_ENDPOINT;
                 result = false;
             }
         }
@@ -8426,7 +8432,6 @@ remove_shared_vmlist(dcontext_t *dcontext, void *vmlist, fragment_t *f,
     fragment_t *entry = (fragment_t *)vmlist;
     fragment_t *next;
     bool remove;
-    bool ok;
     uint check_flags = 0;
     app_pc pc;
     LOG(THREAD, LOG_VMAREAS, 4, "\tremoving shared vm data for F%d(" PFX ")\n", f->id,
@@ -8444,7 +8449,8 @@ remove_shared_vmlist(dcontext_t *dcontext, void *vmlist, fragment_t *f,
         remove = (local_vmlist != NULL && FRAG_PREV(entry) == entry &&
                   !TEST(FRAG_COARSE_GRAIN, f->flags));
         if (remove) {
-            ok = lookup_addr(&shared_data->areas, FRAG_PC(entry), &area);
+            DEBUG_DECLARE(bool ok =)
+            lookup_addr(&shared_data->areas, FRAG_PC(entry), &area);
             ASSERT(ok && area != NULL);
             if (TEST(FRAG_COARSE_GRAIN, area->frag_flags)) {
                 /* Case 9806: do NOT remove the coarse area even if this
@@ -8470,8 +8476,9 @@ remove_shared_vmlist(dcontext_t *dcontext, void *vmlist, fragment_t *f,
             /* add area to local and add local heap also entry */
             if (DYNAMO_OPTION(shared_bbs))
                 check_flags = f->flags | FRAG_SHARED; /*indicator to NOT use global*/
-            ok = check_thread_vm_area(dcontext, pc, f->tag, local_vmlist, &check_flags,
-                                      NULL, false /*xfer should not matter now*/);
+            DEBUG_DECLARE(bool ok =)
+            check_thread_vm_area(dcontext, pc, f->tag, local_vmlist, &check_flags, NULL,
+                                 false /*xfer should not matter now*/);
             ASSERT(ok);
         }
         entry = next;
@@ -9025,7 +9032,8 @@ vm_area_clean_fraglist(dcontext_t *dcontext, vm_area_t *area)
 void
 vm_area_remove_fragment(dcontext_t *dcontext, fragment_t *f)
 {
-    fragment_t *entry, *next, *match;
+    fragment_t *entry, *next;
+    DEBUG_DECLARE(fragment_t * match;)
     /* must grab lock across whole thing since alsos can be changed
      * by vm_area_clean_fraglist()
      */
@@ -9036,11 +9044,11 @@ vm_area_remove_fragment(dcontext_t *dcontext, fragment_t *f)
     if (!multi) {
         LOG(THREAD, LOG_VMAREAS, 4, "vm_area_remove_fragment: F%d tag=" PFX "\n", f->id,
             f->tag);
-        match = f;
+        DODEBUG(match = f;);
     } else {
         /* we do get called for multi-entries from vm_area_destroy_list */
         LOG(THREAD, LOG_VMAREAS, 4, "vm_area_remove_fragment: entry " PFX "\n", f);
-        match = FRAG_FRAG(f);
+        DODEBUG(match = FRAG_FRAG(f););
     }
     ASSERT(FRAG_PREV(f) != NULL); /* prev wraps around, should never be null */
 
@@ -10530,9 +10538,9 @@ handle_modified_code(dcontext_t *dcontext, cache_pc instr_cache_pc, app_pc instr
     /* FIXME: for Linux, this is all happening inside signal handler...
      * flushing could take a while, and signals are blocked the entire time!
      */
-    app_pc base_pc, flush_start = NULL, next_pc;
+    app_pc base_pc, flush_start = NULL;
     app_pc instr_size_pc;
-    size_t size, flush_size = 0, instr_size;
+    size_t size, flush_size = 0;
     uint opnd_size = 0;
     uint prot;
     overlap_info_t info = { 0, /* init to 0 so info.overlap is false */ };
@@ -10631,10 +10639,11 @@ handle_modified_code(dcontext_t *dcontext, cache_pc instr_cache_pc, app_pc instr
      * (FIXME case 7393).
      */
     instr_size_pc = (instr_cache_pc == NULL) ? instr_app_pc : instr_cache_pc;
-    next_pc = decode_memory_reference_size(dcontext, instr_size_pc, &opnd_size);
+    DEBUG_DECLARE(app_pc next_pc =)
+    decode_memory_reference_size(dcontext, instr_size_pc, &opnd_size);
     ASSERT(next_pc != NULL);
     ASSERT(opnd_size != 0);
-    instr_size = next_pc - instr_size_pc;
+    DEBUG_DECLARE(size_t instr_size = next_pc - instr_size_pc;)
     /* FIXME case 7492: if write crosses page boundary, the reported faulting
      * target for win32 will be in the middle of the instr's target (win32
      * reports the first unwritable byte).  (On Linux we're fine as we calculate

@@ -1,5 +1,5 @@
 /* **********************************************************
- * Copyright (c) 2017-2020 Google, Inc.  All rights reserved.
+ * Copyright (c) 2017-2022 Google, Inc.  All rights reserved.
  * Copyright (c) 2016 ARM Limited. All rights reserved.
  * **********************************************************/
 
@@ -80,9 +80,19 @@ instr_branch_type(instr_t *cti_instr)
     case OP_tbnz:
     case OP_tbz: return LINK_DIRECT | LINK_JMP;
     case OP_bl: return LINK_DIRECT | LINK_CALL;
+    case OP_blraa:
+    case OP_blrab:
+    case OP_blraaz:
+    case OP_blrabz:
     case OP_blr: return LINK_INDIRECT | LINK_CALL;
-    case OP_br: return LINK_INDIRECT | LINK_JMP;
-    case OP_ret: return LINK_INDIRECT | LINK_RETURN;
+    case OP_br:
+    case OP_braa:
+    case OP_brab:
+    case OP_braaz:
+    case OP_brabz: return LINK_INDIRECT | LINK_JMP;
+    case OP_ret:
+    case OP_retaa:
+    case OP_retab: return LINK_INDIRECT | LINK_RETURN;
     }
     CLIENT_ASSERT(false, "instr_branch_type: unknown opcode");
     return LINK_INDIRECT;
@@ -105,7 +115,15 @@ bool
 instr_is_call_arch(instr_t *instr)
 {
     int opc = instr->opcode; /* caller ensures opcode is valid */
-    return (opc == OP_bl || opc == OP_blr);
+    switch (opc) {
+    case OP_bl:
+    case OP_blr:
+    case OP_blraa:
+    case OP_blrab:
+    case OP_blraaz:
+    case OP_blrabz: return true;
+    default: return false;
+    }
 }
 
 bool
@@ -126,14 +144,21 @@ bool
 instr_is_call_indirect(instr_t *instr)
 {
     int opc = instr_get_opcode(instr);
-    return (opc == OP_blr);
+    switch (opc) {
+    case OP_blr:
+    case OP_blraa:
+    case OP_blrab:
+    case OP_blraaz:
+    case OP_blrabz: return true;
+    default: return false;
+    }
 }
 
 bool
 instr_is_return(instr_t *instr)
 {
     int opc = instr_get_opcode(instr);
-    return (opc == OP_ret);
+    return (opc == OP_ret || opc == OP_retaa || opc == OP_retab);
 }
 
 bool
@@ -149,7 +174,22 @@ bool
 instr_is_mbr_arch(instr_t *instr)
 {
     int opc = instr->opcode; /* caller ensures opcode is valid */
-    return (opc == OP_blr || opc == OP_br || opc == OP_ret);
+    switch (opc) {
+    case OP_blr:
+    case OP_br:
+    case OP_braa:
+    case OP_brab:
+    case OP_braaz:
+    case OP_brabz:
+    case OP_blraa:
+    case OP_blrab:
+    case OP_blraaz:
+    case OP_blrabz:
+    case OP_ret:
+    case OP_retaa:
+    case OP_retab: return true;
+    default: return false;
+    }
 }
 
 bool
@@ -246,8 +286,15 @@ instr_is_mov_constant(instr_t *instr, ptr_int_t *value)
 bool
 instr_is_prefetch(instr_t *instr)
 {
-    int opcode = instr_get_opcode(instr);
-    return opcode == OP_prfm || opcode == OP_prfum;
+    switch (instr_get_opcode(instr)) {
+    case OP_prfm:
+    case OP_prfum:
+    case OP_prfb:
+    case OP_prfh:
+    case OP_prfw:
+    case OP_prfd: return true;
+    default: return false;
+    }
 }
 
 bool
@@ -423,6 +470,12 @@ reg_is_fp(reg_id_t reg)
 {
     ASSERT_NOT_IMPLEMENTED(false); /* FIXME i#1569 */
     return false;
+}
+
+bool
+reg_is_z(reg_id_t reg)
+{
+    return DR_REG_Z0 <= reg && reg <= DR_REG_Z31;
 }
 
 bool

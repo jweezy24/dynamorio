@@ -1,5 +1,5 @@
 /* **********************************************************
- * Copyright (c) 2010-2022 Google, Inc.  All rights reserved.
+ * Copyright (c) 2010-2023 Google, Inc.  All rights reserved.
  * Copyright (c) 2002-2010 VMware, Inc.  All rights reserved.
  * **********************************************************/
 
@@ -64,29 +64,36 @@
 #    endif
 #    if defined(X86_32) || defined(X86_64)
 #        define X86
-#        if (defined(X86_64) && defined(X86_32)) || defined(ARM_32) || defined(ARM_64)
+#        if (defined(X86_64) && defined(X86_32)) || defined(ARM_32) || \
+            defined(ARM_64) || defined(RISCV_64)
 #            error Target architecture over-specified: must define only one
 #        endif
 #    elif defined(ARM_32)
 #        define ARM
 #        define AARCHXX
-#        if defined(X86_32) || defined(X86_64) || defined(ARM_64)
+#        if defined(X86_32) || defined(X86_64) || defined(ARM_64) || defined(RISCV_64)
 #            error Target architecture over-specified: must define only one
 #        endif
 #    elif defined(ARM_64)
 #        define AARCH64
 #        define AARCHXX
-#        if defined(X86_32) || defined(X86_64) || defined(ARM_32)
+#        if defined(X86_32) || defined(X86_64) || defined(ARM_32) || defined(RISCV_64)
+#            error Target architecture over-specified: must define only one
+#        endif
+#    elif defined(RISCV_64)
+#        define RISCV64
+#        if defined(X86_32) || defined(X86_64) || defined(ARM_32) || defined(ARM_64)
 #            error Target architecture over-specified: must define only one
 #        endif
 #    else
-#        error Target architecture unknown: define X86_32, X86_64, ARM_32, or ARM_64
+#        error Target architecture unknown: define X86_32, X86_64, ARM_32, ARM_64 or \
+               RISCV_64
 #    endif
 #    define DR_API                  /* Ignore for clients. */
 #    define DR_UNS_EXCEPT_TESTS_API /* Ignore for clients. */
 #endif
 
-#if (defined(X86_64) || defined(ARM_64)) && !defined(X64)
+#if (defined(X86_64) || defined(ARM_64) || defined(RISCV_64)) && !defined(X64)
 #    define X64
 #endif
 
@@ -370,9 +377,9 @@ typedef struct {
  */
 typedef struct {
 #    ifdef X64
-    uint black_box_uint[26];
+    uint black_box_uint[28];
 #    else
-    uint black_box_uint[17];
+    uint black_box_uint[18];
 #    endif
 } instr_t;
 #else
@@ -456,6 +463,22 @@ typedef struct _instr_t instr_t;
 #    define _IF_AARCHXX(x)
 #    define IF_NOT_AARCHXX(x) x
 #    define _IF_NOT_AARCHXX(x) , x
+#endif
+
+#ifdef RISCV64
+#    define IF_RISCV64(x) x
+#    define IF_RISCV64_ELSE(x, y) x
+#    define IF_RISCV64_(x) x,
+#    define _IF_RISCV64(x) , x
+#    define IF_NOT_RISCV64(x)
+#    define _IF_NOT_RISCV64(x)
+#else
+#    define IF_RISCV64(x)
+#    define IF_RISCV64_ELSE(x, y) y
+#    define IF_RISCV64_(x)
+#    define _IF_RISCV64(x)
+#    define IF_NOT_RISCV64(x) x
+#    define _IF_NOT_RISCV64(x) , x
 #endif
 
 #ifdef ANDROID
@@ -713,9 +736,23 @@ typedef union _dr_simd_t {
 #    endif
 /**< Number of 16-64-bit OpMask Kn slots in dr_mcontext_t, if architecture supports. */
 #    define MCXT_NUM_OPMASK_SLOTS 8
+
+#elif defined(RISCV64)
+
+/* FIXME i#3544: Not implemented. Definitions just for compiling. */
+typedef union ALIGN_VAR(16) _dr_simd_t {
+    byte b;      /**< Bottom  8 bits of Vn == Bn. */
+    ushort h;    /**< Bottom 16 bits of Vn == Hn. */
+    uint s;      /**< Bottom 32 bits of Vn == Sn. */
+    uint d[2];   /**< Bottom 64 bits of Vn == Dn as d[1]:d[0]. */
+    uint q[4];   /**< 128-bit Qn as q[3]:q[2]:q[1]:q[0]. */
+    uint u32[4]; /**< The full 128-bit register. */
+} dr_simd_t;
+#    define MCXT_NUM_SIMD_SLOTS 8
+#    define MCXT_NUM_OPMASK_SLOTS 0
 #else
 #    error NYI
-#endif /* AARCHXX/X86 */
+#endif /* AARCHXX/X86/RISCV64 */
 
 #ifdef DR_NUM_SIMD_SLOTS_COMPATIBILITY
 
@@ -743,6 +780,7 @@ typedef enum {
      * On x86, selects the xsp, xflags, and xip fields.
      * On ARM, selects the sp, pc, and cpsr fields.
      * On AArch64, selects the sp, pc, and nzcv fields.
+     * On RISC-V, selects the sp, pc and fcsr fields.
      * \note: The xip/pc field is only honored as an input for
      * dr_redirect_execution(), and as an output for system call
      * events.
@@ -793,12 +831,12 @@ typedef struct _module_data_t module_data_t;
 /**
  * Upper note values are reserved for core DR.
  */
-#    define DR_NOTE_FIRST_RESERVED 0xfffffffffffffff0ULL
+#    define DR_NOTE_FIRST_RESERVED 0xffffffffffff0000ULL
 #else
 /**
  * Upper note values are reserved for core DR.
  */
-#    define DR_NOTE_FIRST_RESERVED 0xfffffff0UL
+#    define DR_NOTE_FIRST_RESERVED 0xffff0000UL
 #endif
 enum {
     /**
@@ -811,6 +849,26 @@ enum {
     /** Identifies the end of a clean call. */
     /* This is used to allow instrumentation pre-and-post a clean call for i#4128. */
     DR_NOTE_CLEAN_CALL_END,
+    /**
+     * Identifies a point at which clients should restore all registers to
+     * their application values, as required for DR's internal block mangling.
+     */
+    DR_NOTE_REG_BARRIER,
+    /**
+     * Used for internal translation from an instruction list.  These apply not only to
+     * client-inserted clean calls but all inserted calls whether inserted by
+     * clients or DR and whether fully clean or not.  This is thus distinct from
+     * #DR_NOTE_CLEAN_CALL_END.
+     */
+    DR_NOTE_CALL_SEQUENCE_START,
+    DR_NOTE_CALL_SEQUENCE_END,
+    /**
+     * Placed at the top of a basic block, this identifies the entry to an "rseq" (Linux
+     * restartable sequence) region.  The first two label data fields (see
+     * instr_get_label_data_area()) are filled in with this rseq region's end PC
+     * and its abort handler PC, in that order.
+     */
+    DR_NOTE_RSEQ_ENTRY,
 };
 
 /**

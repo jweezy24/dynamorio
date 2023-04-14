@@ -141,6 +141,39 @@ opnd_is_far_base_disp(opnd_t op)
     return IF_X86_ELSE(op.kind == BASE_DISP_kind && op.aux.segment != DR_REG_NULL, false);
 }
 
+INSTR_INLINE
+bool
+opnd_is_element_vector_reg(opnd_t op)
+{
+    return op.kind == REG_kind && ((op.aux.flags & DR_OPND_IS_VECTOR) != 0);
+}
+
+INSTR_INLINE
+bool
+opnd_is_predicate_reg(opnd_t op)
+{
+    /* TODO i#5488: support for x86 AVC512 mask registers */
+    return IF_AARCH64_ELSE(op.kind == REG_kind &&
+                               op.value.reg_and_element_size.reg >= DR_REG_P0 &&
+                               op.value.reg_and_element_size.reg <= DR_REG_P15,
+                           false);
+}
+
+INSTR_INLINE
+bool
+opnd_is_predicate_merge(opnd_t op)
+{
+    return opnd_is_predicate_reg(op) &&
+        ((op.aux.flags & DR_OPND_IS_MERGE_PREDICATE) != 0);
+}
+
+INSTR_INLINE
+bool
+opnd_is_predicate_zero(opnd_t op)
+{
+    return opnd_is_predicate_reg(op) && ((op.aux.flags & DR_OPND_IS_ZERO_PREDICATE) != 0);
+}
+
 #    if defined(X64) || defined(ARM)
 #        ifdef X86
 #            define OPND_IS_REL_ADDR(op) ((op).kind == REL_ADDR_kind)
@@ -183,8 +216,26 @@ opnd_is_far_rel_addr(opnd_t opnd)
 {
     return false;
 }
-#        endif
-#    endif /* X64 || ARM */
+#        elif defined(RISCV64)
+#            define OPND_IS_REL_ADDR(op) ((op).kind == REL_ADDR_kind)
+#            define opnd_is_rel_addr OPND_IS_REL_ADDR
+
+INSTR_INLINE
+bool
+opnd_is_near_rel_addr(opnd_t opnd)
+{
+    return opnd_is_rel_addr(opnd);
+}
+
+INSTR_INLINE
+bool
+opnd_is_far_rel_addr(opnd_t opnd)
+{
+    /* FIXME i#3544: Decide if this should differentiate between JAL and AUIPC+JALR. */
+    return false;
+}
+#        endif /* RISCV64 */
+#    endif     /* X64 || ARM */
 
 /* opnd_t constructors */
 
@@ -209,7 +260,8 @@ opnd_create_reg(reg_id_t r)
     CLIENT_ASSERT(r <= DR_REG_LAST_ENUM && r != DR_REG_INVALID,
                   "opnd_create_reg: invalid register");
     opnd.kind = REG_kind;
-    opnd.value.reg = r;
+    opnd.value.reg_and_element_size.reg = r;
+    opnd.value.reg_and_element_size.element_size = OPSZ_NA;
     opnd.size = 0; /* indicates full size of reg */
     opnd.aux.flags = 0;
     return opnd;
@@ -226,11 +278,43 @@ opnd_create_reg_partial(reg_id_t r, opnd_size_t subsize)
                   "opnd_create_reg_partial: non-multimedia register");
 #    endif
     opnd.kind = REG_kind;
-    opnd.value.reg = r;
+    opnd.value.reg_and_element_size.reg = r;
+    opnd.value.reg_and_element_size.element_size = OPSZ_NA;
     opnd.size = subsize;
     opnd.aux.flags = 0;
     return opnd;
 }
+
+INSTR_INLINE
+opnd_t
+opnd_create_reg_element_vector(reg_id_t r, opnd_size_t element_size)
+{
+    opnd_t opnd DR_IF_DEBUG(= { 0 }); /* FIXME: Needed until i#417 is fixed. */
+    CLIENT_ASSERT(element_size == 0 || (r <= DR_REG_LAST_ENUM && r != DR_REG_INVALID),
+                  "opnd_create_reg_element_vector: invalid register or no size");
+    opnd.kind = REG_kind;
+    opnd.value.reg_and_element_size.reg = r;
+    opnd.value.reg_and_element_size.element_size = element_size;
+    opnd.aux.flags = DR_OPND_IS_VECTOR;
+    return opnd;
+}
+
+#    ifdef AARCH64
+INSTR_INLINE
+opnd_t
+opnd_create_predicate_reg(reg_id_t r, bool is_merge)
+{
+    opnd_t opnd DR_IF_DEBUG(= { 0 }); /* FIXME: Needed until i#417 is fixed. */
+    CLIENT_ASSERT(r >= DR_REG_P0 && r <= DR_REG_P15,
+                  "opnd_create_predicate_reg: invalid predicate register");
+
+    opnd.kind = REG_kind;
+    opnd.value.reg_and_element_size.reg = r;
+    opnd.aux.flags =
+        (ushort)(is_merge ? DR_OPND_IS_MERGE_PREDICATE : DR_OPND_IS_ZERO_PREDICATE);
+    return opnd;
+}
+#    endif
 
 INSTR_INLINE
 opnd_t
@@ -255,10 +339,10 @@ opnd_create_pc(app_pc pc)
 
 #    define OPND_GET_REG(opnd)                                                          \
         (CLIENT_ASSERT_(opnd_is_reg(opnd), "opnd_get_reg called on non-reg opnd")(opnd) \
-             .value.reg)
+             .value.reg_and_element_size.reg)
 #    define opnd_get_reg OPND_GET_REG
 
-#    ifdef X86
+#    if defined(X86) || defined(RISCV64)
 #        define OPND_GET_FLAGS(opnd)                                                     \
             (CLIENT_ASSERT_(                                                             \
                 opnd_is_reg(opnd) || opnd_is_base_disp(opnd) || opnd_is_immed_int(opnd), \
@@ -302,7 +386,7 @@ opnd_create_pc(app_pc pc)
                                                            opnd_is_rel_addr(opnd)),     \
                             "opnd_get_segment called on invalid opnd type")(opnd)       \
                  .aux.segment)
-#    elif defined(AARCHXX)
+#    elif defined(AARCHXX) || defined(RISCV64)
 #        define OPND_GET_SEGMENT(opnd) DR_REG_NULL
 #    endif
 #    define opnd_get_segment OPND_GET_SEGMENT

@@ -1,5 +1,5 @@
 /* **********************************************************
- * Copyright (c) 2021 Google, LLC  All rights reserved.
+ * Copyright (c) 2021-2023 Google, LLC  All rights reserved.
  * **********************************************************/
 
 /*
@@ -34,6 +34,7 @@
 #define _MEMREF_GEN_ 1
 
 #include "../common/memref.h"
+#include <cstring>
 
 namespace {
 
@@ -49,20 +50,20 @@ gen_data(memref_tid_t tid, bool load, addr_t addr, size_t size)
 }
 
 inline memref_t
-gen_instr_type(trace_type_t type, memref_tid_t tid, addr_t pc)
+gen_instr_type(trace_type_t type, memref_tid_t tid, addr_t pc, size_t size = 1)
 {
     memref_t memref = {};
     memref.instr.type = type;
     memref.instr.tid = tid;
     memref.instr.addr = pc;
-    memref.instr.size = 1;
+    memref.instr.size = size;
     return memref;
 }
 
 inline memref_t
-gen_instr(memref_tid_t tid, addr_t pc)
+gen_instr(memref_tid_t tid, addr_t pc, size_t size = 1)
 {
-    return gen_instr_type(TRACE_TYPE_INSTR, tid, pc);
+    return gen_instr_type(TRACE_TYPE_INSTR, tid, pc, size);
 }
 
 inline memref_t
@@ -70,6 +71,51 @@ gen_branch(memref_tid_t tid, addr_t pc)
 {
     return gen_instr_type(TRACE_TYPE_INSTR_CONDITIONAL_JUMP, tid, pc);
 }
+
+// We use these client defines which are the target and so drdecode's target arch.
+#if defined(ARM_64) || defined(ARM_32)
+// Variant for aarchxx encodings.
+inline memref_t
+gen_instr_encoded(addr_t pc, int encoding, memref_tid_t tid = 1)
+{
+    memref_t memref = gen_instr_type(TRACE_TYPE_INSTR, tid, pc, 4);
+    memcpy(memref.instr.encoding, &encoding, sizeof(encoding));
+    memref.instr.encoding_is_new = true;
+    return memref;
+}
+
+inline memref_t
+gen_branch_encoded(memref_tid_t tid, addr_t pc, int encoding)
+{
+    memref_t memref = gen_instr_type(TRACE_TYPE_INSTR_CONDITIONAL_JUMP, tid, pc);
+    memref.instr.size = 4;
+    memcpy(memref.instr.encoding, &encoding, sizeof(encoding));
+    memref.instr.encoding_is_new = true;
+    return memref;
+}
+
+#elif defined(X86_64) || defined(X86_32)
+inline memref_t
+gen_instr_encoded(addr_t pc, const std::vector<char> &encoding, memref_tid_t tid = 1)
+{
+    memref_t memref = gen_instr_type(TRACE_TYPE_INSTR, tid, pc, encoding.size());
+    memcpy(memref.instr.encoding, encoding.data(), encoding.size());
+    memref.instr.encoding_is_new = true;
+    return memref;
+}
+
+// Variant for x86 encodings.
+inline memref_t
+gen_branch_encoded(memref_tid_t tid, addr_t pc, const std::vector<char> &encoding)
+{
+    memref_t memref = gen_instr_type(TRACE_TYPE_INSTR_CONDITIONAL_JUMP, tid, pc);
+    memref.instr.size = encoding.size();
+    memcpy(memref.instr.encoding, encoding.data(), encoding.size());
+    memref.instr.encoding_is_new = true;
+    return memref;
+}
+#else
+#endif
 
 inline memref_t
 gen_marker(memref_tid_t tid, trace_marker_type_t type, uintptr_t val)

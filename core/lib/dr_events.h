@@ -1,5 +1,5 @@
 /* **********************************************************
- * Copyright (c) 2010-2021 Google, Inc.  All rights reserved.
+ * Copyright (c) 2010-2023 Google, Inc.  All rights reserved.
  * Copyright (c) 2002-2010 VMware, Inc.  All rights reserved.
  * **********************************************************/
 
@@ -72,6 +72,62 @@ DR_API
  */
 bool
 dr_unregister_exit_event(void (*func)(void));
+
+DR_API
+/**
+ * Registers a function which is called after all other threads have been taken over
+ * during a process attach event, whether externally triggered or internally triggered
+ * (via dr_app_start() or related functions).  If this process instance was not
+ * initiated by an attach or takeover methodology where multiple application threads may
+ * exist at the time of takeover (such as a process newly created on Linux), this
+ * registration function returns false.
+ *
+ * The attach methodology operates in a staggered fashion, with each thread being taken
+ * over and executed under DR control in turn.  If the application has many threads,
+ * threads taken over early in this process may execute substantial amounts of
+ * instrumented code before the threads taken over last start executing instrumented
+ * code.  The purpose of this event is to provide a single control point where all
+ * threads are known to be under DR control and running instrumented code.
+ */
+bool
+dr_register_post_attach_event(void (*func)(void));
+
+DR_API
+/**
+ * Unregister a callback function for the post-attach event (see
+ * dr_register_post_attach_event()).  \return true if unregistration is successful and
+ * false if it is not (e.g., \p func was not registered).
+ */
+bool
+dr_unregister_post_attach_event(void (*func)(void));
+
+DR_API
+/**
+ * Registers a function which is called at the start of a full detach of DR from the
+ * current process, whether externally triggered or internally triggered (via
+ * dr_app_stop_and_cleanup() or related functions), as well as at the start of DR
+ * sending all threads native but not cleaning up its own state (through dr_app_stop()).
+ *
+ * The detach methodology operates in a staggered fashion, with each thread being
+ * returned to native control in turn.  If the application has many threads, threads
+ * detached late in this process may execute substantial amounts of instrumented code
+ * before the full detach process is complete, while threads detached early are running
+ * natively.  The purpose of this event is to provide a single final control point where
+ * all threads are known to be under DR control and running instrumented code.  The exit
+ * event (see dr_register_exit_event()) is not called until after all other threads have
+ * been detached.
+ */
+void
+dr_register_pre_detach_event(void (*func)(void));
+
+DR_API
+/**
+ * Unregister a callback function for the post-attach event (see
+ * dr_register_pre_detach_event()).  \return true if unregistration is successful and
+ * false if it is not (e.g., \p func was not registered).
+ */
+bool
+dr_unregister_pre_detach_event(void (*func)(void));
 
 /**
  * Flags controlling the behavior of basic blocks and traces when emitted
@@ -175,7 +231,7 @@ DR_API
  * creation (false) or is for address translation (true).  This is
  * further explained below.
  *
- * \return a #dr_emit_flags_t flag.
+ * The callback function should return a #dr_emit_flags_t flag.
  *
  * The user is free to inspect and modify the block before it
  * executes, but must adhere to the following restrictions:
@@ -191,6 +247,8 @@ DR_API
  * block.
  * - There can only be one far branch (call, jump, or return) in
  * a basic block, and it must be the final instruction in the
+ * block.
+ * - The AArch64 instruction ISB must be the final instruction in the
  * block.
  * - The exit control-flow of a block ending in a system call or
  * int instruction cannot be changed, nor can instructions be inserted
@@ -387,7 +445,7 @@ DR_API
  * (false) or is for fault address recreation (true).  This is further
  * explained below.
  *
- * \return a #dr_emit_flags_t flag.
+ * The callback function should return a #dr_emit_flags_t flag.
  *
  * The user is free to inspect and modify the non-control-flow
  * instructions in the trace before it
@@ -626,7 +684,8 @@ typedef struct _dr_fault_fragment_info_t {
     /**
      * The start address of the code fragment inside the code cache at
      * the exception/signal/translation interruption point. NULL for interruption
-     * not in the code cache.  Clients are cautioned when examining
+     * not in the code cache (in which case generally only unusual cases of clients
+     * changing memory require restoration).  Clients are cautioned when examining
      * code cache instructions to not rely on any details of code
      * inserted other than their own.
      */
@@ -650,7 +709,8 @@ typedef struct _dr_fault_fragment_info_t {
      * When the recreated ilist is not available, this is set to NULL. This
      * may happen when a client returns #DR_EMIT_STORE_TRANSLATIONS, or for
      * DR internal reasons when the app code may not be consistent: for pending
-     * deletion or self-modifying fragments.
+     * deletion or self-modifying fragments.  It will also be NULL for non-code-cache
+     * cases where \p cache_start_pc is also NULL.
      */
     instrlist_t *ilist;
 } dr_fault_fragment_info_t;
@@ -937,7 +997,14 @@ typedef enum {
     DR_XFER_CONTINUE,           /**< NtContinue system call. */
     DR_XFER_SET_CONTEXT_THREAD, /**< NtSetContextThread system call. */
     DR_XFER_CLIENT_REDIRECT,    /**< dr_redirect_execution() or #DR_SIGNAL_REDIRECT. */
-    DR_XFER_RSEQ_ABORT,         /**< A Linux restartable sequence was aborted. */
+    /**
+     * A Linux restartable sequence was aborted.  The interrupted PC for a signal in
+     * the execution instrumentation points to the precise interrupted
+     * instruction; but for an abort in the native exeuction, the PC always points
+     * to the abort handler, rather than the precise instruction that was aborted.
+     * This aligns with kernel behavior: the interrupted PC is not saved anywhere.
+     */
+    DR_XFER_RSEQ_ABORT,
 } dr_kernel_xfer_type_t;
 
 /** Data structure passed for dr_register_kernel_xfer_event(). */

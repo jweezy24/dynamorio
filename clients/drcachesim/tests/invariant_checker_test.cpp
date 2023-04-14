@@ -1,5 +1,5 @@
 /* **********************************************************
- * Copyright (c) 2021-2022 Google, LLC  All rights reserved.
+ * Copyright (c) 2021-2023 Google, LLC  All rights reserved.
  * **********************************************************/
 
 /*
@@ -58,12 +58,12 @@ public:
 protected:
     void
     report_if_false(per_shard_t *shard, bool condition,
-                    const std::string &message) override
+                    const std::string &invariant_name) override
     {
         if (!condition) {
-            errors.push_back(message);
-            error_tids.push_back(shard->tid);
-            error_refs.push_back(shard->ref_count);
+            errors.push_back(invariant_name);
+            error_tids.push_back(shard->tid_);
+            error_refs.push_back(shard->ref_count_);
         }
     }
 };
@@ -183,16 +183,6 @@ check_branch_target_after_branch()
 bool
 check_sane_control_flow()
 {
-    // Positive test: branches.
-    {
-        std::vector<memref_t> memrefs = {
-            gen_instr(1, 1),   gen_branch(1, 2),  gen_instr(1, 3), // Not taken.
-            gen_branch(1, 4),  gen_instr(1, 101),                  // Taken.
-            gen_instr(1, 102),
-        };
-        if (!run_checker(memrefs, false))
-            return false;
-    }
     // Negative simple test.
     {
         std::vector<memref_t> memrefs = {
@@ -203,6 +193,66 @@ check_sane_control_flow()
                          "Failed to catch bad control flow"))
             return false;
     }
+    // Positive test: branches with no encodings.
+    {
+        std::vector<memref_t> memrefs = {
+            gen_instr(1, 1),   gen_branch(1, 2),  gen_instr(1, 3), // Not taken.
+            gen_branch(1, 4),  gen_instr(1, 101),                  // Taken.
+            gen_instr(1, 102),
+        };
+        if (!run_checker(memrefs, false))
+            return false;
+    }
+    // Tests with encodings:
+    // We use these client defines which are the target and so drdecode's target arch.
+#if defined(X86_64) || defined(X86_32) || defined(ARM_64)
+    // XXX: We hardcode encodings here.  If we need many more we should generate them
+    // from DR IR.
+
+    // Negative test: branches with encodings which do not go to their targets.
+    {
+        std::vector<memref_t> memrefs = {
+            gen_marker(1, TRACE_MARKER_TYPE_FILETYPE, OFFLINE_FILE_TYPE_ENCODINGS),
+#    if defined(X86_64) || defined(X86_32)
+            // 0x74 is "je" with the 2nd byte the offset.
+            gen_branch_encoded(1, 0x71019dbc, { 0x74, 0x32 }),
+            gen_instr_encoded(0x71019ded, { 0x01 }),
+#    elif defined(ARM_64)
+            // 71019dbc:   540001a1        b.ne    71019df0 <__executable_start+0x19df0>
+            gen_branch_encoded(1, 0x71019dbc, 0x540001a1),
+            gen_instr_encoded(0x71019ded, 0x01),
+#    else
+        // TODO i#5871: Add AArch32 (and RISC-V) encodings.
+#    endif
+        };
+
+        if (!run_checker(memrefs, true, 1, 3,
+                         "Direct branch does not go to the correct target",
+                         "Failed to catch branch not going to its target")) {
+            return false;
+        }
+    }
+    // Positive test: branches with encodings which go to their targets.
+    {
+        std::vector<memref_t> memrefs = {
+            gen_marker(1, TRACE_MARKER_TYPE_FILETYPE, OFFLINE_FILE_TYPE_ENCODINGS),
+#    if defined(X86_64) || defined(X86_32)
+            // 0x74 is "je" with the 2nd byte the offset.
+            gen_branch_encoded(1, 0x71019dbc, { 0x74, 0x32 }),
+#    elif defined(ARM_64)
+            // 71019dbc:   540001a1        b.ne    71019df0 <__executable_start+0x19df0>
+            gen_branch_encoded(1, 0x71019dbc, 0x540001a1),
+#    else
+        // TODO i#5871: Add AArch32 (and RISC-V) encodings.
+#    endif
+            gen_instr(1, 0x71019df0),
+        };
+
+        if (!run_checker(memrefs, false, 1)) {
+            return false;
+        }
+    }
+#endif
     // String loop.
     {
         std::vector<memref_t> memrefs = {
@@ -246,6 +296,38 @@ check_kernel_xfer()
         if (!run_checker(memrefs, false))
             return false;
     }
+    // Signal before any instr in the trace.
+    {
+        std::vector<memref_t> memrefs = {
+            // No instr in the beginning here.
+            gen_marker(1, TRACE_MARKER_TYPE_KERNEL_EVENT, 2),
+            gen_instr(1, 101),
+            // XXX: This marker value is actually not guaranteed, yet the checker
+            // requires it and the view tool prints it.
+            gen_marker(1, TRACE_MARKER_TYPE_KERNEL_XFER, 102),
+            gen_instr(1, 2),
+        };
+        if (!run_checker(memrefs, false))
+            return false;
+    }
+    // Nested signals without any intervening instr.
+    {
+        std::vector<memref_t> memrefs = {
+            gen_instr(1, 1),
+            gen_marker(1, TRACE_MARKER_TYPE_KERNEL_EVENT, 2),
+            // No intervening instr here.
+            gen_marker(1, TRACE_MARKER_TYPE_KERNEL_EVENT, 101),
+            gen_instr(1, 201),
+            // XXX: This marker value is actually not guaranteed, yet the checker
+            // requires it and the view tool prints it.
+            gen_marker(1, TRACE_MARKER_TYPE_KERNEL_XFER, 202),
+            gen_instr(1, 101),
+            gen_marker(1, TRACE_MARKER_TYPE_KERNEL_XFER, 102),
+            gen_instr(1, 2),
+        };
+        if (!run_checker(memrefs, false))
+            return false;
+    }
     // Fail to return to recorded interruption point.
     {
         std::vector<memref_t> memrefs = {
@@ -268,11 +350,27 @@ check_rseq()
     // Roll back rseq final instr.
     {
         std::vector<memref_t> memrefs = {
+            gen_marker(1, TRACE_MARKER_TYPE_RSEQ_ENTRY, 3),
+            gen_instr(1, 1),
+            // Rolled back instr at pc=2 size=1.
+            // Point to the abort handler.
+            gen_marker(1, TRACE_MARKER_TYPE_RSEQ_ABORT, 4),
+            gen_marker(1, TRACE_MARKER_TYPE_KERNEL_EVENT, 4),
+            gen_instr(1, 4),
+        };
+        if (!run_checker(memrefs, false))
+            return false;
+    }
+    {
+        std::vector<memref_t> memrefs = {
+            gen_marker(1, TRACE_MARKER_TYPE_RSEQ_ENTRY, 3),
             gen_instr(1, 1),
             gen_instr(1, 2),
-            gen_marker(1, TRACE_MARKER_TYPE_RSEQ_ABORT, 1),
-            gen_marker(1, TRACE_MARKER_TYPE_KERNEL_EVENT, 1),
-            gen_instr(1, 1),
+            // A fault in the instrumented execution.
+            gen_marker(1, TRACE_MARKER_TYPE_RSEQ_ABORT, 2),
+            gen_marker(1, TRACE_MARKER_TYPE_KERNEL_EVENT, 2),
+            gen_marker(1, TRACE_MARKER_TYPE_KERNEL_EVENT, 4),
+            gen_instr(1, 4),
         };
         if (!run_checker(memrefs, false))
             return false;
@@ -280,13 +378,14 @@ check_rseq()
     // Fail to roll back rseq final instr.
     {
         std::vector<memref_t> memrefs = {
+            gen_marker(1, TRACE_MARKER_TYPE_RSEQ_ENTRY, 3),
             gen_instr(1, 1),
             gen_instr(1, 2),
-            gen_marker(1, TRACE_MARKER_TYPE_RSEQ_ABORT, 2),
-            gen_marker(1, TRACE_MARKER_TYPE_KERNEL_EVENT, 2),
-            gen_instr(1, 1),
+            gen_marker(1, TRACE_MARKER_TYPE_RSEQ_ABORT, 4),
+            gen_marker(1, TRACE_MARKER_TYPE_KERNEL_EVENT, 4),
+            gen_instr(1, 4),
         };
-        if (!run_checker(memrefs, true, 1, 3,
+        if (!run_checker(memrefs, true, 1, 4,
                          "Rseq post-abort instruction not rolled back",
                          "Failed to catch bad rseq abort"))
             return false;
@@ -294,13 +393,159 @@ check_rseq()
 #endif
     return true;
 }
+
+bool
+check_function_markers()
+{
+    constexpr memref_tid_t TID = 1;
+    constexpr addr_t CALL_PC = 2;
+    constexpr size_t CALL_SZ = 2;
+    // Incorrectly between instr and memref.
+    {
+        std::vector<memref_t> memrefs = {
+            gen_instr_type(TRACE_TYPE_INSTR_DIRECT_CALL, TID, CALL_PC, CALL_SZ),
+            gen_marker(1, TRACE_MARKER_TYPE_FUNC_ID, 2),
+            // There should be just one error.
+            gen_marker(1, TRACE_MARKER_TYPE_FUNC_RETADDR, CALL_PC + CALL_SZ),
+            gen_marker(1, TRACE_MARKER_TYPE_FUNC_ARG, 2),
+            gen_data(1, true, 42, 8),
+        };
+        if (!run_checker(memrefs, true, TID, 5,
+                         "Function marker misplaced between instr and memref",
+                         "Failed to catch misplaced function marker"))
+            return false;
+    }
+    // Incorrectly not after a branch.
+    {
+        std::vector<memref_t> memrefs = {
+            gen_instr(TID, 1),
+            gen_marker(TID, TRACE_MARKER_TYPE_FUNC_ID, 2),
+        };
+        if (!run_checker(memrefs, true, TID, 2,
+                         "Function marker should be after a branch",
+                         "Failed to catch function marker not after branch"))
+            return false;
+    }
+    // Incorrect return address.
+    {
+        std::vector<memref_t> memrefs = {
+            gen_instr_type(TRACE_TYPE_INSTR_DIRECT_CALL, TID, CALL_PC, CALL_SZ),
+            gen_marker(TID, TRACE_MARKER_TYPE_FUNC_ID, 2),
+            gen_marker(TID, TRACE_MARKER_TYPE_FUNC_RETADDR, CALL_PC + CALL_SZ + 1),
+            gen_marker(TID, TRACE_MARKER_TYPE_FUNC_ARG, 2),
+        };
+        if (!run_checker(memrefs, true, TID, 3,
+                         "Function marker retaddr should match prior call",
+                         "Failed to catch wrong function retaddr"))
+            return false;
+    }
+    // Incorrectly not after a branch with a load in between.
+    {
+        std::vector<memref_t> memrefs = {
+            gen_instr(TID, 1),
+            gen_data(TID, true, 42, 8),
+            gen_marker(TID, TRACE_MARKER_TYPE_FUNC_ID, 2),
+        };
+        if (!run_checker(memrefs, true, TID, 3,
+                         "Function marker should be after a branch",
+                         "Failed to catch function marker after non-branch with load"))
+            return false;
+    }
+    // Correctly after a branch.
+    {
+        std::vector<memref_t> memrefs = {
+            gen_instr(TID, 1),
+            gen_instr_type(TRACE_TYPE_INSTR_DIRECT_CALL, TID, CALL_PC, CALL_SZ),
+            gen_marker(TID, TRACE_MARKER_TYPE_FUNC_ID, 2),
+            gen_marker(TID, TRACE_MARKER_TYPE_FUNC_RETADDR, CALL_PC + CALL_SZ),
+            gen_marker(TID, TRACE_MARKER_TYPE_FUNC_ARG, 2),
+        };
+        if (!run_checker(memrefs, false))
+            return false;
+    }
+    // Correctly after a branch with memref for the branch.
+    {
+        std::vector<memref_t> memrefs = {
+            gen_instr(TID, 1),
+            gen_instr_type(TRACE_TYPE_INSTR_DIRECT_CALL, TID, CALL_PC, CALL_SZ),
+            gen_instr_type(TRACE_TYPE_INSTR_INDIRECT_JUMP, TID, 3),
+            gen_data(TID, true, 42, 8),
+            gen_marker(TID, TRACE_MARKER_TYPE_FUNC_ID, 2),
+            gen_marker(TID, TRACE_MARKER_TYPE_FUNC_RETADDR, CALL_PC + CALL_SZ),
+            gen_marker(TID, TRACE_MARKER_TYPE_FUNC_ARG, 2),
+        };
+        if (!run_checker(memrefs, false))
+            return false;
+    }
+    return true;
+}
+
+bool
+check_duplicate_syscall_with_same_pc()
+{
+    constexpr addr_t ADDR = 0x7fcf3b9dd9e9;
+    // Negative: syscalls with the same PC.
+#if defined(X86_64) || defined(X86_32) || defined(ARM_64)
+    {
+        std::vector<memref_t> memrefs = {
+            gen_marker(1, TRACE_MARKER_TYPE_FILETYPE, OFFLINE_FILE_TYPE_ENCODINGS),
+#    if defined(X86_64) || defined(X86_32)
+            gen_instr_encoded(ADDR, { 0x0f, 0x05 }), // 0x7fcf3b9dd9e9: 0f 05 syscall
+            gen_marker(1, TRACE_MARKER_TYPE_TIMESTAMP, 0),
+            gen_marker(1, TRACE_MARKER_TYPE_CPU_ID, 3),
+            gen_instr_encoded(ADDR, { 0x0f, 0x05 }), // 0x7fcf3b9dd9e9: 0f 05 syscall
+#    elif defined(ARM_64)
+            gen_instr_encoded(ADDR,
+                              0xd4000001), // 0x7fcf3b9dd9e9: 0xd4000001 svc #0x0
+            gen_marker(1, TRACE_MARKER_TYPE_TIMESTAMP, 0),
+            gen_marker(1, TRACE_MARKER_TYPE_CPU_ID, 3),
+            gen_instr_encoded(ADDR,
+                              0xd4000001), // 0x7fcf3b9dd9e9: 0xd4000001 svc #0x0
+#    else
+        // TODO i#5871: Add AArch32 (and RISC-V) encodings.
+#    endif
+        };
+        if (!run_checker(memrefs, true, 1, 5, "Duplicate syscall instrs with the same PC",
+                         "Failed to catch duplicate syscall instrs with the same PC"))
+            return false;
+    }
+
+    // Positive test: syscalls with different PCs.
+    {
+        std::vector<memref_t> memrefs = {
+            gen_marker(1, TRACE_MARKER_TYPE_FILETYPE, OFFLINE_FILE_TYPE_ENCODINGS),
+#    if defined(X86_64) || defined(X86_32)
+            gen_instr_encoded(ADDR, { 0x0f, 0x05 }), // 0x7fcf3b9dd9e9: 0f 05 syscall
+            gen_marker(1, TRACE_MARKER_TYPE_TIMESTAMP, 0),
+            gen_marker(1, TRACE_MARKER_TYPE_CPU_ID, 3),
+            gen_instr_encoded(ADDR + 2, { 0x0f, 0x05 }), // 0x7fcf3b9dd9eb: 0f 05 syscall
+#    elif defined(ARM_64)
+            gen_instr_encoded(ADDR, 0xd4000001,
+                              2), // 0x7fcf3b9dd9e9: 0xd4000001 svc #0x0
+            gen_marker(1, TRACE_MARKER_TYPE_TIMESTAMP, 0),
+            gen_marker(1, TRACE_MARKER_TYPE_CPU_ID, 3),
+            gen_instr_encoded(ADDR + 4, 0xd4000001,
+                              2), // 0x7fcf3b9dd9eb: 0xd4000001 svc #0x0
+#    else
+        // TODO i#5871: Add AArch32 (and RISC-V) encodings.
+#    endif
+        };
+        if (!run_checker(memrefs, false)) {
+            return false;
+        }
+    }
+#endif
+    return true;
+}
+
 } // namespace
 
 int
 main(int argc, const char *argv[])
 {
     if (check_branch_target_after_branch() && check_sane_control_flow() &&
-        check_kernel_xfer() && check_rseq()) {
+        check_kernel_xfer() && check_rseq() && check_function_markers() &&
+        check_duplicate_syscall_with_same_pc()) {
         std::cerr << "invariant_checker_test passed\n";
         return 0;
     }

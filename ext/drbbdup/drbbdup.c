@@ -1,5 +1,5 @@
 /* **********************************************************
- * Copyright (c) 2013-2022 Google, Inc.   All rights reserved.
+ * Copyright (c) 2013-2023 Google, Inc.   All rights reserved.
  * **********************************************************/
 
 /*
@@ -84,8 +84,9 @@ typedef enum {
 } drbbdup_thread_slots_t;
 
 /* A scratch register used by drbbdup's dispatcher. */
-#define DRBBDUP_SCRATCH_REG IF_X86_ELSE(DR_REG_XAX, DR_REG_R0)
-#define DRBBDUP_SCRATCH_REG_NO_FLAGS IF_X86_ELSE(DR_REG_XCX, DR_REG_R0)
+#define DRBBDUP_SCRATCH_REG IF_X86_ELSE(DR_REG_XAX, IF_RISCV64_ELSE(DR_REG_A0, DR_REG_R0))
+#define DRBBDUP_SCRATCH_REG_NO_FLAGS \
+    IF_X86_ELSE(DR_REG_XCX, IF_RISCV64_ELSE(DR_REG_A0, DR_REG_R0))
 #ifdef AARCHXX
 /* RISC architectures need a 2nd scratch register. */
 #    define DRBBDUP_SCRATCH_REG2 DR_REG_R1
@@ -105,7 +106,9 @@ typedef struct {
 typedef struct {
     bool enable_dup;              /* Denotes whether to duplicate blocks. */
     bool enable_dynamic_handling; /* Denotes whether to dynamically generate cases. */
-    bool are_flags_dead;      /* Denotes whether flags are dead at the start of a bb. */
+#if !defined(RISCV64)
+    bool are_flags_dead; /* Denotes whether flags are dead at the start of a bb. */
+#endif
     bool is_scratch_reg_dead; /* Denotes whether DRBBDUP_SCRATCH_REG is dead at start. */
     reg_id_t scratch_reg;
 #ifdef AARCHXX
@@ -134,6 +137,7 @@ typedef struct {
     instr_t *first_instr;          /* The first instr of the bb copy being considered. */
     instr_t *first_nonlabel_instr; /* The first non label instr of the bb copy. */
     instr_t *last_instr;           /* The last instr of the bb copy being considered. */
+    byte *tls_seg_base;            /* For access from another thread. */
 } drbbdup_per_thread;
 
 static bool is_thread_private = false; /* Denotes whether DR caches are thread-private. */
@@ -168,24 +172,30 @@ static instr_t *
 drbbdup_first_app(instrlist_t *bb);
 
 static uintptr_t *
-drbbdup_get_tls_raw_slot_addr(drbbdup_thread_slots_t slot_idx)
+drbbdup_get_tls_raw_slot_addr(void *drcontext, drbbdup_thread_slots_t slot_idx)
 {
     ASSERT(0 <= slot_idx && slot_idx < DRBBDUP_SLOT_COUNT, "out-of-bounds slot index");
-    byte *base = dr_get_dr_segment_base(tls_raw_reg);
+    /* We cannot call dr_get_dr_segment_base() here since we need to support
+     * being called from another thread so we use our stored value.
+     */
+    drbbdup_per_thread *pt =
+        (drbbdup_per_thread *)drmgr_get_tls_field(drcontext, tls_idx);
+    byte *base = pt->tls_seg_base;
     return (uintptr_t *)(base + tls_raw_base + slot_idx * sizeof(uintptr_t));
 }
 
 static void
-drbbdup_set_tls_raw_slot_val(drbbdup_thread_slots_t slot_idx, uintptr_t val)
+drbbdup_set_tls_raw_slot_val(void *drcontext, drbbdup_thread_slots_t slot_idx,
+                             uintptr_t val)
 {
-    uintptr_t *addr = drbbdup_get_tls_raw_slot_addr(slot_idx);
+    uintptr_t *addr = drbbdup_get_tls_raw_slot_addr(drcontext, slot_idx);
     *addr = val;
 }
 
 static uintptr_t
-drbbdup_get_tls_raw_slot_val(drbbdup_thread_slots_t slot_idx)
+drbbdup_get_tls_raw_slot_val(void *drcontext, drbbdup_thread_slots_t slot_idx)
 {
-    uintptr_t *addr = drbbdup_get_tls_raw_slot_addr(slot_idx);
+    uintptr_t *addr = drbbdup_get_tls_raw_slot_addr(drcontext, slot_idx);
     return *addr;
 }
 
@@ -222,7 +232,7 @@ drbbdup_is_special_instr(instr_t *instr)
 {
     return instr != NULL &&
         (instr_is_syscall(instr) || instr_is_cti(instr) || instr_is_ubr(instr) ||
-         instr_is_interrupt(instr));
+         instr_is_interrupt(instr) IF_AARCH64(|| instr_get_opcode(instr) == OP_isb));
 }
 
 /****************************************************************************
@@ -966,11 +976,13 @@ static void
 drbbdup_insert_landing_restoration(void *drcontext, instrlist_t *bb, instr_t *where,
                                    const drbbdup_manager_t *manager)
 {
+#if !defined(RISCV64)
     if (!manager->are_flags_dead) {
         drbbdup_restore_register(drcontext, bb, where, DRBBDUP_FLAG_REG_SLOT,
                                  manager->scratch_reg);
         dr_restore_arith_flags_from_reg(drcontext, bb, where, manager->scratch_reg);
     }
+#endif
     if (!manager->is_scratch_reg_dead) {
         drbbdup_restore_register(drcontext, bb, where, DRBBDUP_SCRATCH_REG_SLOT,
                                  manager->scratch_reg);
@@ -1005,6 +1017,7 @@ drbbdup_encode_runtime_case(void *drcontext, drbbdup_per_thread *pt, void *tag,
      * manually perform the spilling for finer control across branches used by the
      * dispatcher.
      */
+#if !defined(RISCV64)
     if (drbbdup_case_zero_vs_nonzero(manager)) {
         manager->are_flags_dead = true; /* Not used, so don't restore. */
         manager->scratch_reg = DRBBDUP_SCRATCH_REG_NO_FLAGS;
@@ -1014,6 +1027,10 @@ drbbdup_encode_runtime_case(void *drcontext, drbbdup_per_thread *pt, void *tag,
     }
     drreg_is_register_dead(drcontext, manager->scratch_reg, where,
                            &manager->is_scratch_reg_dead);
+#else
+    /* Since RISC-V does not have a flags register, always use the standard reg. */
+    manager->scratch_reg = DRBBDUP_SCRATCH_REG;
+#endif
     if (!manager->is_scratch_reg_dead) {
         drbbdup_spill_register(drcontext, bb, where, DRBBDUP_SCRATCH_REG_SLOT,
                                manager->scratch_reg);
@@ -1031,15 +1048,24 @@ drbbdup_encode_runtime_case(void *drcontext, drbbdup_per_thread *pt, void *tag,
         }
     }
 #endif
+#if !defined(RISCV64)
     if (!manager->are_flags_dead) {
         dr_save_arith_flags_to_reg(drcontext, bb, where, manager->scratch_reg);
         drbbdup_spill_register(drcontext, bb, where, DRBBDUP_FLAG_REG_SLOT,
                                manager->scratch_reg);
-        if (!manager->is_scratch_reg_dead) {
+        /* If we're invoking a clean call, restore the scratch reg.  If we're not,
+         * we assume runtime_case_opnd will not refer to the scratch reg (it has
+         * to be absolute/pc-rel if it does not use a clean call).
+         */
+        if (!manager->is_scratch_reg_dead && opts.insert_encode != NULL) {
+            /* This extra restore that keeps scratch_reg spilled requires special
+             * handling in drbbdup_event_restore_state().
+             */
             drbbdup_restore_register(drcontext, bb, where, DRBBDUP_SCRATCH_REG_SLOT,
                                      manager->scratch_reg);
         }
     }
+#endif
 
     /* Encoding is application-specific and therefore we need the user to define the
      * encoding of the runtime case. Therefore, we invoke a user-defined call-back.
@@ -1528,12 +1554,12 @@ drbbdup_instrument_dups(void *drcontext, void *tag, instrlist_t *bb, instr_t *in
             drbbdup_insert_dispatch_end(drcontext, tag, bb, next_instr, manager);
         } else {
             /* We have reached the start of a new bb version (not the last one). */
-            bool found = false;
+            IF_DEBUG(bool found = false;)
             int i;
             for (i = pt->case_index + 1; i < opts.non_default_case_limit; i++) {
                 drbbdup_case = &manager->cases[i];
                 if (drbbdup_case->is_defined) {
-                    found = true;
+                    IF_DEBUG(found = true;)
                     break;
                 }
             }
@@ -1739,22 +1765,26 @@ drbbdup_include_encoding(drbbdup_manager_t *manager, uintptr_t new_encoding)
  */
 
 static void
-drbbdup_prepare_redirect(dr_mcontext_t *mcontext, drbbdup_manager_t *manager,
-                         app_pc bb_pc)
+drbbdup_prepare_redirect(void *drcontext, dr_mcontext_t *mcontext,
+                         drbbdup_manager_t *manager, app_pc bb_pc)
 {
     /* Restore flags and scratch reg to their original app values. */
+#if !defined(RISCV64)
     if (!manager->are_flags_dead) {
-        reg_t val = (reg_t)drbbdup_get_tls_raw_slot_val(DRBBDUP_FLAG_REG_SLOT);
+        reg_t val = (reg_t)drbbdup_get_tls_raw_slot_val(drcontext, DRBBDUP_FLAG_REG_SLOT);
         mcontext->xflags = dr_merge_arith_flags(mcontext->xflags, val);
     }
+#endif
     if (!manager->is_scratch_reg_dead) {
-        reg_set_value(manager->scratch_reg, mcontext,
-                      (reg_t)drbbdup_get_tls_raw_slot_val(DRBBDUP_SCRATCH_REG_SLOT));
+        reg_set_value(
+            manager->scratch_reg, mcontext,
+            (reg_t)drbbdup_get_tls_raw_slot_val(drcontext, DRBBDUP_SCRATCH_REG_SLOT));
     }
 #ifdef AARCHXX
     if (manager->is_scratch_reg2_needed && !manager->is_scratch_reg2_dead) {
-        reg_set_value(DRBBDUP_SCRATCH_REG2, mcontext,
-                      (reg_t)drbbdup_get_tls_raw_slot_val(DRBBDUP_SCRATCH_REG2_SLOT));
+        reg_set_value(
+            DRBBDUP_SCRATCH_REG2, mcontext,
+            (reg_t)drbbdup_get_tls_raw_slot_val(drcontext, DRBBDUP_SCRATCH_REG2_SLOT));
     }
 #endif
 
@@ -1817,7 +1847,7 @@ drbbdup_manage_new_case(void *drcontext, hashtable_t *manager_table,
     /* Regardless of whether or not flushing is going to happen, redirection will
      * always be performed.
      */
-    drbbdup_prepare_redirect(mcontext, manager, pc);
+    drbbdup_prepare_redirect(drcontext, mcontext, manager, pc);
 
     return do_flush;
 }
@@ -1847,7 +1877,8 @@ drbbdup_handle_new_case()
     ASSERT(pc != NULL, "pc cannot be NULL");
 
     /* Get the missing case. */
-    uintptr_t new_encoding = drbbdup_get_tls_raw_slot_val(DRBBDUP_ENCODING_SLOT);
+    uintptr_t new_encoding =
+        drbbdup_get_tls_raw_slot_val(drcontext, DRBBDUP_ENCODING_SLOT);
 
     bool do_flush = false;
 
@@ -2029,6 +2060,10 @@ drbbdup_thread_init(void *drcontext)
         DR_MEMPROT_READ | DR_MEMPROT_WRITE, NULL);
     memset(pt, 0, sizeof(*pt));
 
+    drmgr_set_tls_field(drcontext, tls_idx, (void *)pt);
+
+    pt->tls_seg_base = dr_get_dr_segment_base(tls_raw_reg);
+
     if (is_thread_private) {
         /* Initialise hash table that keeps track of defined cases per
          * basic block (for thread-private DR caches only).
@@ -2057,10 +2092,9 @@ drbbdup_thread_init(void *drcontext)
         /* Init hit table. */
         for (int i = 0; i < TABLE_SIZE; i++)
             pt->hit_counts[i] = opts.hit_threshold;
-        drbbdup_set_tls_raw_slot_val(DRBBDUP_HIT_TABLE_SLOT, (uintptr_t)pt->hit_counts);
+        drbbdup_set_tls_raw_slot_val(drcontext, DRBBDUP_HIT_TABLE_SLOT,
+                                     (uintptr_t)pt->hit_counts);
     }
-
-    drmgr_set_tls_field(drcontext, tls_idx, (void *)pt);
 }
 
 static void
@@ -2084,6 +2118,178 @@ drbbdup_thread_exit(void *drcontext)
                        TABLE_SIZE * sizeof(pt->hit_counts[0]));
     }
     dr_custom_free(drcontext, DR_ALLOC_THREAD_PRIVATE, pt, sizeof(drbbdup_per_thread));
+}
+
+/****************************************************************************
+ * STATE RESTORATION
+ */
+
+/* TODO i#5686: We need to provide restore-state events to other libraries/clients
+ * so we can present just the bb copy containing the target translation point.
+ */
+
+static bool
+is_our_spill_or_restore(void *drcontext, instr_t *instr, bool *spill OUT,
+                        reg_id_t *reg_out OUT, uint *slot_out OUT, uint *offs_out OUT)
+{
+    bool tls;
+    uint offs;
+    reg_id_t reg;
+    if (!instr_is_reg_spill_or_restore(drcontext, instr, &tls, spill, &reg, &offs))
+        return false;
+    if (!tls)
+        return false;
+    if (offs < tls_raw_base ||
+        offs > (tls_raw_base + (DRBBDUP_SLOT_COUNT - 1) * sizeof(uintptr_t)))
+        return false;
+    uint slot = (offs - tls_raw_base) / sizeof(uintptr_t);
+    /* DRBBDUP_ENCODING_SLOT and DRBBDUP_HIT_TABLE_SLOT are not used as app spills. */
+    if (slot == DRBBDUP_ENCODING_SLOT || slot == DRBBDUP_HIT_TABLE_SLOT)
+        return false;
+    if (reg_out != NULL)
+        *reg_out = reg;
+    if (slot_out != NULL)
+        *slot_out = slot;
+    if (offs_out != NULL)
+        *offs_out = offs;
+    return true;
+}
+
+static bool
+drbbdup_event_restore_state(void *drcontext, bool restore_memory,
+                            dr_restore_state_info_t *info)
+{
+    if (info->fragment_info.cache_start_pc == NULL ||
+        /* Check for a DR-added prefix. */
+        info->raw_mcontext->pc < info->fragment_info.cache_start_pc) {
+        /* We have no non-code-cache state to restore. */
+        return true;
+    }
+    if (info->fragment_info.ilist == NULL) {
+        /* TODO i#5686: Decode from the cache to build an ilist and pass it to the code
+         * below.  We'll need heuristics to generate DRBBDUP_LABEL_START (XXX i#3801 on
+         * letting us store our labels).  For now we bail and assume this is rare enough
+         * to force an asynch xl8 to retry.
+         */
+        return false;
+    }
+    /* We expect spills at the top of the bb from drbbdup_encode_runtime_case()
+     * with (duplicated) restores at the top of each copy from
+     * drbbdup_insert_landing_restoration().
+     */
+    reg_id_t slots[DRBBDUP_SLOT_COUNT];
+    for (int i = 0; i < DRBBDUP_SLOT_COUNT; i++)
+        slots[i] = DR_REG_NULL;
+    reg_id_t top_slots[DRBBDUP_SLOT_COUNT];
+    byte *pc = info->fragment_info.cache_start_pc;
+    byte *containing_copy_start_pc = NULL;
+    instr_t *containing_copy_start_instr = NULL;
+    bool prior_instr_was_flag_spill = false;
+    bool found_copy = false;
+    for (instr_t *inst = instrlist_first(info->fragment_info.ilist); inst != NULL;
+         inst = instr_get_next(inst)) {
+        if (pc == info->raw_mcontext->pc) {
+            /* We found the faulting instruction. */
+            for (int i = 0; i < DRBBDUP_SLOT_COUNT; i++) {
+                if (slots[i] == DR_REG_NULL)
+                    continue;
+                reg_t val = drbbdup_get_tls_raw_slot_val(drcontext, i);
+#if !defined(RISCV64)
+                if (i == DRBBDUP_FLAG_REG_SLOT) {
+                    reg_t cur = info->mcontext->xflags;
+                    cur = dr_merge_arith_flags(cur, val);
+                    LOG(drcontext, DR_LOG_ALL, 3,
+                        "%s: restoring aflags at %p (+%zd) from slot %d from " PFX
+                        " to " PFX "\n",
+                        __FUNCTION__, pc, pc - info->fragment_info.cache_start_pc, i,
+                        info->mcontext->xflags, cur);
+                    info->mcontext->xflags = cur;
+                } else {
+#endif
+                    LOG(drcontext, DR_LOG_ALL, 3,
+                        "%s: restoring %s at %p (+%zd) from slot %d from " PFX " to " PFX
+                        "\n",
+                        __FUNCTION__, get_register_name(slots[i]), pc,
+                        pc - info->fragment_info.cache_start_pc, i,
+                        reg_get_value(slots[i], info->mcontext), val);
+                    reg_set_value(slots[i], info->mcontext, val);
+#if !defined(RISCV64)
+                }
+#endif
+            }
+            /* Modify the parameters to subsequent restore callbacks so they focus on
+             * just the relevant copy so that clients and libraries don't have to be
+             * drbbdup-aware (if they have state machines or other construts they may
+             * get confused as they cross from one copy to another).  This is a little
+             * hacky but the alternative is a big change: integrate drbbdup into drmgr
+             * so it can more cleanly control the parameters.
+             */
+            if (containing_copy_start_pc != NULL) {
+                LOG(drcontext, DR_LOG_ALL, 2,
+                    "%s: changing cache_start_pc from %p to %p\n", __FUNCTION__,
+                    info->fragment_info.cache_start_pc, containing_copy_start_pc);
+                info->fragment_info.cache_start_pc = containing_copy_start_pc;
+                instr_t *in = instrlist_first(info->fragment_info.ilist);
+                instr_t *nxt;
+                while (in != containing_copy_start_instr) {
+                    nxt = instr_get_next(in);
+                    instrlist_remove(info->fragment_info.ilist, in);
+                    instr_destroy(drcontext, in);
+                    in = nxt;
+                }
+            }
+            return true;
+        }
+        if (drbbdup_is_at_label(inst, DRBBDUP_LABEL_START)) {
+            /* Remember the top slots and re-use them for each copy.  This label is
+             * before the next dispatch, but that is what we want as this is the target
+             * of the prior no-match dispatch.
+             */
+            LOG(drcontext, DR_LOG_ALL, 4, "%s: start label at %p\n", __FUNCTION__, pc);
+            containing_copy_start_pc = pc;
+            containing_copy_start_instr = inst;
+            if (!found_copy) {
+                found_copy = true;
+                memcpy(top_slots, slots, sizeof(top_slots));
+            } else {
+                memcpy(slots, top_slots, sizeof(slots));
+            }
+        }
+        bool spill;
+        reg_id_t reg;
+        uint slot, offs;
+        if (is_our_spill_or_restore(drcontext, inst, &spill, &reg, &slot, &offs)) {
+            LOG(drcontext, DR_LOG_ALL, 4, "%s: %s at %p\n", __FUNCTION__,
+                spill ? "spill" : "restore", pc);
+            if (spill) {
+                if (slots[slot] != DR_REG_NULL && slots[slot] != reg) {
+                    ASSERT(false, "spill clobbers another slot: state restore error");
+                    return false;
+                }
+                if (slot == DRBBDUP_FLAG_REG_SLOT)
+                    prior_instr_was_flag_spill = true;
+                else
+                    prior_instr_was_flag_spill = false;
+                slots[slot] = reg;
+            } else {
+                if (slots[slot] == DR_REG_NULL) {
+                    ASSERT(false, "restore uses empty slot: state restore error");
+                    return false;
+                }
+                /* Special case: do not clear for the extra restore after the flag spill
+                 * in drbbdup_encode_runtime_case().
+                 */
+                if (!prior_instr_was_flag_spill)
+                    slots[slot] = DR_REG_NULL;
+                prior_instr_was_flag_spill = false;
+            }
+        }
+        pc += instr_length(drcontext, inst);
+        if (pc > info->raw_mcontext->pc)
+            break; /* Error, with assert outside the loop. */
+    }
+    ASSERT(false, "state restore failed to find target instr");
+    return false;
 }
 
 /****************************************************************************
@@ -2160,12 +2366,17 @@ drbbdup_init(drbbdup_options_t *ops_in)
     drmgr_priority_t insert_priority = { sizeof(drmgr_priority_t),
                                          DRMGR_PRIORITY_INSERT_NAME_DRBBDUP, NULL, NULL,
                                          DRMGR_PRIORITY_INSERT_DRBBDUP };
+    drmgr_priority_t restore_priority = { sizeof(drmgr_priority_t),
+                                          DRMGR_PRIORITY_RESTORE_NAME_DRBBDUP, NULL, NULL,
+                                          DRMGR_PRIORITY_RESTORE_DRBBDUP };
 
     if (!drmgr_register_bb_app2app_event(drbbdup_duplicate_phase, &app2app_priority) ||
         !drmgr_register_bb_instrumentation_ex_event(
             NULL, drbbdup_analyse_phase, drbbdup_link_phase, NULL, &insert_priority) ||
         !drmgr_register_thread_init_event(drbbdup_thread_init) ||
         !drmgr_register_thread_exit_event(drbbdup_thread_exit) ||
+        !drmgr_register_restore_state_ex_event_ex(drbbdup_event_restore_state,
+                                                  &restore_priority) ||
         !dr_raw_tls_calloc(&tls_raw_reg, &tls_raw_base, DRBBDUP_SLOT_COUNT, 0) ||
         drreg_init(&drreg_ops) != DRREG_SUCCESS)
         return DRBBDUP_ERROR;
@@ -2218,6 +2429,7 @@ drbbdup_exit(void)
                                                           drbbdup_link_phase, NULL) ||
             !drmgr_unregister_thread_init_event(drbbdup_thread_init) ||
             !drmgr_unregister_thread_exit_event(drbbdup_thread_exit) ||
+            !drmgr_unregister_restore_state_ex_event(drbbdup_event_restore_state) ||
             !dr_raw_tls_cfree(tls_raw_base, DRBBDUP_SLOT_COUNT) ||
             !drmgr_unregister_tls_field(tls_idx) || drreg_exit() != DRREG_SUCCESS)
             return DRBBDUP_ERROR;

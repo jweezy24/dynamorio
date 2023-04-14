@@ -104,8 +104,8 @@ insert_out_of_line_context_switch(dcontext_t *dcontext, instrlist_t *ilist,
     insert_reachable_cti(dcontext, ilist, instr, encode_pc,
                          save ? get_clean_call_save(dcontext _IF_X64(GENCODE_X64))
                               : get_clean_call_restore(dcontext _IF_X64(GENCODE_X64)),
-                         false /*call*/, true /*returns*/, false /*!precise*/, DR_REG_R11,
-                         NULL);
+                         false /*call*/, true /*returns*/, false /*!precise*/,
+                         CALL_SCRATCH_REG, NULL);
     return get_clean_call_switch_stack_size();
 }
 
@@ -938,7 +938,7 @@ insert_reachable_cti(dcontext_t *dcontext, instrlist_t *ilist, instr_t *where,
 /*###########################################################################
  *###########################################################################
  *
- *   M A N G L I N G   R O U T I N E S
+ * MANGLING ROUTINES
  */
 
 /* Updates the immediates used by insert_mov_immed_arch() to use the value "val".
@@ -1726,8 +1726,8 @@ mangle_return(dcontext_t *dcontext, instrlist_t *ilist, instr_t *instr,
     }
 
     if (TEST(INSTR_CLOBBER_RETADDR, instr->flags)) {
-        /* we put the value in the note field earlier */
-        ptr_uint_t val = (ptr_uint_t)instr->note;
+        /* we put the value in the offset field earlier */
+        ptr_uint_t val = (ptr_uint_t)instr->offset;
         insert_mov_ptr_uint_beyond_TOS(dcontext, ilist, instr, val, retsz);
     }
 

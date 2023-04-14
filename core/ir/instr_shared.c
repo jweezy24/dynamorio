@@ -1,5 +1,5 @@
 /* **********************************************************
- * Copyright (c) 2011-2021 Google, Inc.  All rights reserved.
+ * Copyright (c) 2011-2023 Google, Inc.  All rights reserved.
  * Copyright (c) 2000-2010 VMware, Inc.  All rights reserved.
  * **********************************************************/
 
@@ -161,6 +161,7 @@ instr_clone(void *drcontext, instr_t *orig)
     }
     /* copy note (we make no guarantee, and have no way, to do a deep clone) */
     instr->note = orig->note;
+    instr->offset = orig->offset;
     if (instr_is_label(orig))
         memcpy(&instr->label_data, &orig->label_data, sizeof(instr->label_data));
     return instr;
@@ -175,6 +176,18 @@ instr_init(void *drcontext, instr_t *instr)
      * an uninitialized instruction */
     memset((void *)instr, 0, sizeof(instr_t));
     instr_set_isa_mode(instr, dr_get_isa_mode(dcontext));
+#ifndef NOT_DYNAMORIO_CORE_PROPER
+    /* Just like in global_heap_alloc() we pay the cost of this check to support
+     * drdecode use even with full DR linked in (i#2499).  Decoding of simple
+     * single-source-no-dest instrs never hits the heap code so we check here too.
+     */
+    if (dcontext == GLOBAL_DCONTEXT && !dynamo_heap_initialized) {
+        /* TODO i#2499: We have no control point currently to call standalone_exit().
+         * We need to develop a solution with atexit() or ELF destructors or sthg.
+         */
+        standalone_init();
+    }
+#endif
 }
 
 /* zeroes out the fields of instr */
@@ -1490,7 +1503,7 @@ instr_decode_cti(dcontext_t *dcontext, instr_t *instr)
      */
     if (!instr_opcode_valid(instr) ||
         (instr_is_cti(instr) && !instr_operands_valid(instr))) {
-        byte *next_pc;
+        DEBUG_EXT_DECLARE(byte * next_pc;)
         DEBUG_EXT_DECLARE(int old_len = instr->length;)
         /* decode_cti() will use the dcontext mode, but we want the instr mode */
         dr_isa_mode_t old_mode;
@@ -1498,7 +1511,7 @@ instr_decode_cti(dcontext_t *dcontext, instr_t *instr)
         CLIENT_ASSERT(instr_raw_bits_valid(instr),
                       "instr_decode_cti: raw bits are invalid");
         instr_reuse(dcontext, instr);
-        next_pc = decode_cti(dcontext, instr->bytes, instr);
+        DEBUG_EXT_DECLARE(next_pc =) decode_cti(dcontext, instr->bytes, instr);
         dr_set_isa_mode(dcontext, old_mode, NULL);
         /* ok to be invalid, let caller deal with it */
         CLIENT_ASSERT(next_pc == NULL || (next_pc - instr->bytes == old_len),
@@ -1517,7 +1530,7 @@ void
 instr_decode_opcode(dcontext_t *dcontext, instr_t *instr)
 {
     if (!instr_opcode_valid(instr)) {
-        byte *next_pc;
+        DEBUG_EXT_DECLARE(byte * next_pc;)
         DEBUG_EXT_DECLARE(int old_len = instr->length;)
 #ifdef X86
         bool rip_rel_valid = instr_rip_rel_valid(instr);
@@ -1528,7 +1541,7 @@ instr_decode_opcode(dcontext_t *dcontext, instr_t *instr)
         CLIENT_ASSERT(instr_raw_bits_valid(instr),
                       "instr_decode_opcode: raw bits are invalid");
         instr_reuse(dcontext, instr);
-        next_pc = decode_opcode(dcontext, instr->bytes, instr);
+        DEBUG_EXT_DECLARE(next_pc =) decode_opcode(dcontext, instr->bytes, instr);
         dr_set_isa_mode(dcontext, old_mode, NULL);
 #ifdef X86
         /* decode_opcode sets raw bits which invalidates rip_rel, but
@@ -1550,7 +1563,7 @@ void
 instr_decode(dcontext_t *dcontext, instr_t *instr)
 {
     if (!instr_operands_valid(instr)) {
-        byte *next_pc;
+        DEBUG_EXT_DECLARE(byte * next_pc;)
         DEBUG_EXT_DECLARE(int old_len = instr->length;)
 #ifdef X86
         bool rip_rel_valid = instr_rip_rel_valid(instr);
@@ -1560,7 +1573,7 @@ instr_decode(dcontext_t *dcontext, instr_t *instr)
         dr_set_isa_mode(dcontext, instr_get_isa_mode(instr), &old_mode);
         CLIENT_ASSERT(instr_raw_bits_valid(instr), "instr_decode: raw bits are invalid");
         instr_reuse(dcontext, instr);
-        next_pc = decode(dcontext, instr_get_raw_bits(instr), instr);
+        DEBUG_EXT_DECLARE(next_pc =) decode(dcontext, instr_get_raw_bits(instr), instr);
 #ifndef NOT_DYNAMORIO_CORE_PROPER
         if (expand_should_set_translation(dcontext))
             instr_set_translation(instr, instr_get_raw_bits(instr));
@@ -2656,7 +2669,8 @@ instr_is_cti(instr_t *instr) /* any control-transfer instruction */
 int
 instr_get_interrupt_number(instr_t *instr)
 {
-    CLIENT_ASSERT(instr_get_opcode(instr) == IF_X86_ELSE(OP_int, OP_svc),
+    CLIENT_ASSERT(instr_get_opcode(instr) ==
+                      IF_X86_ELSE(OP_int, IF_RISCV64_ELSE(OP_ecall, OP_svc)),
                   "instr_get_interrupt_number: instr not interrupt");
     if (instr_operands_valid(instr)) {
         ptr_int_t val = opnd_get_immed_int(instr_get_src(instr, 0));
@@ -2881,6 +2895,22 @@ instr_create_1dst_5src(void *drcontext, int opcode, opnd_t dst, opnd_t src1, opn
     instr_set_src(in, 2, src3);
     instr_set_src(in, 3, src4);
     instr_set_src(in, 4, src5);
+    return in;
+}
+
+instr_t *
+instr_create_1dst_6src(void *drcontext, int opcode, opnd_t dst, opnd_t src1, opnd_t src2,
+                       opnd_t src3, opnd_t src4, opnd_t src5, opnd_t src6)
+{
+    dcontext_t *dcontext = (dcontext_t *)drcontext;
+    instr_t *in = instr_build(dcontext, opcode, 1, 6);
+    instr_set_dst(in, 0, dst);
+    instr_set_src(in, 0, src1);
+    instr_set_src(in, 1, src2);
+    instr_set_src(in, 2, src3);
+    instr_set_src(in, 3, src4);
+    instr_set_src(in, 4, src5);
+    instr_set_src(in, 5, src6);
     return in;
 }
 
@@ -3278,7 +3308,7 @@ instr_create_Ndst_Msrc_varsrc(void *drcontext, int opcode, uint fixed_dsts,
     va_list ap;
     instr_t *in = instr_build(dcontext, opcode, fixed_dsts, fixed_srcs + var_srcs);
     uint i;
-    reg_id_t prev_reg = REG_NULL;
+    DEBUG_EXT_DECLARE(reg_id_t prev_reg = REG_NULL;)
     bool check_order;
     va_start(ap, var_ord);
     for (i = 0; i < fixed_dsts; i++)
@@ -3297,7 +3327,7 @@ instr_create_Ndst_Msrc_varsrc(void *drcontext, int opcode, uint fixed_dsts,
                       "instr_create_Ndst_Msrc_varsrc: wrong register order in reglist");
         instr_set_src(in, var_ord + i, opnd_add_flags(opnd, DR_OPND_IN_LIST));
         if (check_order)
-            prev_reg = opnd_get_reg(opnd);
+            DEBUG_EXT_DECLARE(prev_reg = opnd_get_reg(opnd));
     }
     va_end(ap);
     return in;
@@ -3311,7 +3341,7 @@ instr_create_Ndst_Msrc_vardst(void *drcontext, int opcode, uint fixed_dsts,
     va_list ap;
     instr_t *in = instr_build(dcontext, opcode, fixed_dsts + var_dsts, fixed_srcs);
     uint i;
-    reg_id_t prev_reg = REG_NULL;
+    DEBUG_EXT_DECLARE(reg_id_t prev_reg = REG_NULL;)
     bool check_order;
     va_start(ap, var_ord);
     for (i = 0; i < MIN(var_ord, fixed_dsts); i++)
@@ -3330,7 +3360,7 @@ instr_create_Ndst_Msrc_vardst(void *drcontext, int opcode, uint fixed_dsts,
                       "instr_create_Ndst_Msrc_vardst: wrong register order in reglist");
         instr_set_dst(in, var_ord + i, opnd_add_flags(opnd, DR_OPND_IN_LIST));
         if (check_order)
-            prev_reg = opnd_get_reg(opnd);
+            DEBUG_EXT_DECLARE(prev_reg = opnd_get_reg(opnd));
     }
     va_end(ap);
     return in;
@@ -3603,7 +3633,11 @@ instr_raw_is_tls_spill(byte *pc, reg_id_t reg, ushort offs)
     /* FIXME i#1551, i#1569: NYI on ARM/AArch64 */
     ASSERT_NOT_IMPLEMENTED(false);
     return false;
-#    endif /* X86/ARM */
+#    elif defined(RISCV64)
+    /* FIXME i#3544: Not implemented. */
+    ASSERT_NOT_IMPLEMENTED(false);
+    return false;
+#    endif /* X86/ARM/RISCV64 */
 }
 
 /* this routine may upgrade a level 1 instr */
@@ -3639,6 +3673,10 @@ instr_check_tls_spill_restore(instr_t *instr, bool *spill, reg_id_t *reg, int *o
         opnd_is_abs_base_disp(memop)
 #    elif defined(AARCHXX)
         opnd_is_base_disp(memop) && opnd_get_base(memop) == dr_reg_stolen &&
+        opnd_get_index(memop) == DR_REG_NULL
+#    elif defined(RISCV64)
+        /* FIXME i#3544: Check if valid. */
+        opnd_is_base_disp(memop) && opnd_get_base(memop) == DR_REG_TP &&
         opnd_get_index(memop) == DR_REG_NULL
 #    endif
     ) {
@@ -3693,6 +3731,10 @@ instr_is_tls_xcx_spill(instr_t *instr)
         return instr_is_tls_spill(instr, REG_ECX, MANGLE_XCX_SPILL_SLOT);
 #    elif defined(AARCHXX)
     /* FIXME i#1551, i#1569: NYI on ARM/AArch64 */
+    ASSERT_NOT_IMPLEMENTED(false);
+    return false;
+#    elif defined(RISCV64)
+    /* FIXME i#3544: Not implemented */
     ASSERT_NOT_IMPLEMENTED(false);
     return false;
 #    endif
@@ -3883,7 +3925,11 @@ move_mm_reg_opcode(bool aligned16, bool aligned32)
 #    elif defined(AARCH64)
     ASSERT_NOT_IMPLEMENTED(false); /* FIXME i#1569 */
     return 0;
-#    endif /* X86/ARM */
+#    elif defined(RISCV64)
+    /* FIXME i#3544: Not implemented */
+    ASSERT_NOT_IMPLEMENTED(false);
+    return 0;
+#    endif /* X86/ARM/RISCV64 */
 }
 
 uint

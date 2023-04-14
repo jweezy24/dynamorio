@@ -45,15 +45,20 @@
 
 class view_t : public analysis_tool_t {
 public:
+    // The module_file_path is optional and unused for traces with
+    // OFFLINE_FILE_TYPE_ENCODINGS.
+    // XXX: Once we update our toolchains to guarantee C++17 support we could use
+    // std::optional here.
     view_t(const std::string &module_file_path, memref_tid_t thread, uint64_t skip_refs,
            uint64_t sim_refs, const std::string &syntax, unsigned int verbose,
            const std::string &alt_module_dir = "");
     std::string
-    initialize() override;
+    initialize_stream(memtrace_stream_t *serial_stream) override;
     bool
     parallel_shard_supported() override;
     void *
-    parallel_shard_init(int shard_index, void *worker_data) override;
+    parallel_shard_init_stream(int shard_index, void *worker_data,
+                               memtrace_stream_t *shard_stream) override;
     bool
     parallel_shard_exit(void *shard_data) override;
     bool
@@ -64,6 +69,12 @@ public:
     process_memref(const memref_t &memref) override;
     bool
     print_results() override;
+
+    static constexpr int
+    tid_column_width()
+    {
+        return TID_COLUMN_WIDTH;
+    }
 
 protected:
     struct dcontext_cleanup_last_t {
@@ -77,34 +88,47 @@ protected:
     };
 
     bool
-    should_skip(const memref_t &memref);
+    should_skip(memtrace_stream_t *memstream, const memref_t &memref);
 
     inline void
     print_header()
     {
-        std::cerr << std::setw(9) << "Output format:\n<record#>"
-                  << ": T<tid> <record details>\n"
+        std::cerr << "Output format:\n"
+                  << "<--record#-> <--instr#->: <---tid---> <record details>\n"
                   << "------------------------------------------------------------\n";
     }
 
     inline void
-    print_prefix(const memref_t &memref, int ref_adjust = 0,
-                 std::ostream &stream = std::cerr)
+    print_prefix(memtrace_stream_t *memstream, const memref_t &memref,
+                 int64_t record_ord_subst = -1, std::ostream &stream = std::cerr)
     {
-        if (prev_tid_ != -1 && prev_tid_ != memref.instr.tid)
+        uint64_t record_ord = record_ord_subst > -1
+            ? static_cast<uint64_t>(record_ord_subst)
+            : memstream->get_record_ordinal();
+        if ((prev_tid_ != -1 && prev_tid_ != memref.instr.tid) ||
+            // Print a divider for a skip_instructions gap too.
+            (prev_record_ != 0 && prev_record_ + 1 < record_ord))
             stream << "------------------------------------------------------------\n";
         prev_tid_ = memref.instr.tid;
-        stream << std::setw(9) << (num_refs_ + ref_adjust) << ": T" << memref.marker.tid
-               << " ";
+        prev_record_ = record_ord;
+
+        stream << std::setw(RECORD_COLUMN_WIDTH) << record_ord
+               << std::setw(INSTR_COLUMN_WIDTH) << memstream->get_instruction_ordinal()
+               << ": " << std::setw(TID_COLUMN_WIDTH) << memref.marker.tid << " ";
     }
 
     /* We make this the first field so that dr_standalone_exit() is called after
      * destroying the other fields which may use DR heap.
      */
     dcontext_cleanup_last_t dcontext_;
+
+    // These are all optional and unused for OFFLINE_FILE_TYPE_ENCODINGS.
+    // XXX: Once we update our toolchains to guarantee C++17 support we could use
+    // std::optional here.
     std::string module_file_path_;
     std::unique_ptr<module_mapper_t> module_mapper_;
     raw2trace_directory_t directory_;
+
     unsigned int knob_verbose_;
     int trace_version_;
     static const std::string TOOL_NAME;
@@ -119,12 +143,21 @@ protected:
     uint64_t num_disasm_instrs_;
     std::unordered_map<app_pc, std::string> disasm_cache_;
     memref_tid_t prev_tid_;
+    uint64_t prev_record_ = 0;
     intptr_t filetype_;
     std::unordered_set<memref_tid_t> printed_header_;
-    uint64_t num_refs_;
     std::unordered_map<memref_tid_t, uintptr_t> last_window_;
     uintptr_t timestamp_;
+    int64_t timestamp_record_ord_ = -1;
+    int64_t version_record_ord_ = -1;
+    int64_t filetype_record_ord_ = -1;
     bool has_modules_;
+    memtrace_stream_t *serial_stream_ = nullptr;
+
+private:
+    static constexpr int RECORD_COLUMN_WIDTH = 12;
+    static constexpr int INSTR_COLUMN_WIDTH = 12;
+    static constexpr int TID_COLUMN_WIDTH = 11;
 };
 
 #endif /* _VIEW_H_ */

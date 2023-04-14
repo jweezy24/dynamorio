@@ -307,7 +307,13 @@ module_fill_os_data(ELF_PROGRAM_HEADER_TYPE *prog_hdr, /* PT_DYNAMIC entry */
 
                 /* test string readability while still in try/except
                  * in case we screwed up somewhere or module is
-                 * malformed/only partially mapped */
+                 * malformed/only partially mapped.
+                 *
+                 * i#3385: strlen fails here in case when .dynstr is
+                 * placed in the end of segment (thus soname is not mapped
+                 * at the moment). We'll try to re-init module data again
+                 * in instrument_module_load_trigger() at first execution.
+                 */
                 if (*soname != NULL && strlen(*soname) == -1) {
                     ASSERT_NOT_REACHED();
                 }
@@ -961,6 +967,8 @@ module_init_os_privmod_data_from_dyn(os_privmod_data_t *opd, ELF_DYNAMIC_ENTRY_T
         case DT_RELA: opd->rela = (ELF_RELA_TYPE *)(dyn->d_un.d_ptr + load_delta); break;
         case DT_RELASZ: opd->relasz = (size_t)dyn->d_un.d_val; break;
         case DT_RELAENT: opd->relaent = (size_t)dyn->d_un.d_val; break;
+        case DT_RELRSZ: opd->relrsz = (size_t)dyn->d_un.d_val; break;
+        case DT_RELR: opd->relr = (ELF_WORD *)(dyn->d_un.d_ptr + load_delta); break;
         case DT_VERNEED: opd->verneed = (app_pc)(dyn->d_un.d_ptr + load_delta); break;
         case DT_VERNEEDNUM: opd->verneednum = dyn->d_un.d_val; break;
         case DT_VERSYM: opd->versym = (ELF_HALF *)(dyn->d_un.d_ptr + load_delta); break;
@@ -1417,6 +1425,8 @@ dr_symbol_export_iterator_stop(dr_symbol_export_iterator_t *dr_iter)
 /* Defined in aarch64.asm. */
 ptr_int_t
 tlsdesc_resolver(struct tlsdesc_t *);
+#    elif defined(RISCV64)
+/* RISC-V does not use TLS descriptors. */
 #    else
 static ptr_int_t
 tlsdesc_resolver(struct tlsdesc_t *arg)
@@ -1504,6 +1514,7 @@ module_relocate_symbol(ELF_REL_TYPE *rel, os_privmod_data_t *pd, bool is_rela)
             *r_addr = sym->st_value + addend;
         break;
 #ifndef ANDROID
+#    ifndef RISCV64 /* RISCV64 does not use TLS descriptors */
     case ELF_R_TLS_DESC: {
         /* Provided the client does not invoke dr_load_aux_library after the
          * app has started and might have called clone, TLS descriptors can be
@@ -1515,6 +1526,7 @@ module_relocate_symbol(ELF_REL_TYPE *rel, os_privmod_data_t *pd, bool is_rela)
         tlsdesc->arg = (void *)(sym->st_value + addend - pd->tls_offset);
         break;
     }
+#    endif
 #    ifndef X64
     case R_386_TLS_TPOFF32:
         /* offset is positive, backward from the thread pointer */
@@ -1554,7 +1566,9 @@ module_relocate_symbol(ELF_REL_TYPE *rel, os_privmod_data_t *pd, bool is_rela)
         return;
     }
     switch (r_type) {
+#ifndef RISCV64 /* FIXME i#3544: Check whether ELF_R_DIRECT with !is_rela is OK */
     case ELF_R_GLOB_DAT:
+#endif
     case ELF_R_JUMP_SLOT: *r_addr = (reg_t)res + addend; break;
     case ELF_R_DIRECT: *r_addr = (reg_t)res + (is_rela ? addend : *r_addr); break;
     case ELF_R_COPY:
@@ -1591,7 +1605,7 @@ module_relocate_rel(app_pc modbase, os_privmod_data_t *pd, ELF_REL_TYPE *start,
 {
     ELF_REL_TYPE *rel;
 
-    LOG(GLOBAL, LOG_LOADER, 4, "%s walking rel %p-%p\n", start, end);
+    LOG(GLOBAL, LOG_LOADER, 4, "%s walking rel %p-%p\n", __FUNCTION__, start, end);
     for (rel = start; rel < end; rel++)
         module_relocate_symbol(rel, pd, false);
 }
@@ -1606,7 +1620,34 @@ module_relocate_rela(app_pc modbase, os_privmod_data_t *pd, ELF_RELA_TYPE *start
 {
     ELF_RELA_TYPE *rela;
 
-    LOG(GLOBAL, LOG_LOADER, 4, "%s walking rela %p-%p\n", start, end);
+    LOG(GLOBAL, LOG_LOADER, 4, "%s walking rela %p-%p\n", __FUNCTION__, start, end);
     for (rela = start; rela < end; rela++)
         module_relocate_symbol((ELF_REL_TYPE *)rela, pd, true);
+}
+
+void
+/* This routine is duplicated in privload_relocate_relr for relocating
+ * dynamorio symbols in a bootstrap stage. Any update here should be also
+ * updated in privload_relocate_relr.
+ */
+module_relocate_relr(app_pc modbase, os_privmod_data_t *pd, const ELF_WORD *relr,
+                     size_t size)
+{
+    ELF_ADDR *r_addr = NULL;
+
+    LOG(GLOBAL, LOG_LOADER, 4, "%s walking relr %p-%p\n", __FUNCTION__, relr,
+        (char *)relr + size);
+    for (; size != 0; relr++, size -= sizeof(ELF_WORD)) {
+        if (!TEST(1, relr[0])) {
+            r_addr = (ELF_ADDR *)(relr[0] + pd->load_delta);
+            *r_addr++ += pd->load_delta;
+        } else {
+            int i = 0;
+            for (ELF_WORD bitmap = relr[0]; (bitmap >>= 1) != 0; i++) {
+                if (TEST(1, bitmap))
+                    r_addr[i] += pd->load_delta;
+            }
+            r_addr += CHAR_BIT * sizeof(ELF_WORD) - 1;
+        }
+    }
 }

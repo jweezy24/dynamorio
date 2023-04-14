@@ -1,5 +1,5 @@
 /* **********************************************************
- * Copyright (c) 2010-2022 Google, Inc.  All rights reserved.
+ * Copyright (c) 2010-2023 Google, Inc.  All rights reserved.
  * Copyright (c) 2000-2010 VMware, Inc.  All rights reserved.
  * **********************************************************/
 
@@ -97,6 +97,8 @@ typedef struct _translate_walk_t {
     bool in_mangle_region_epilogue;
     /* What is the translation target of the current mangle region */
     app_pc translation;
+    /* Are we inside a clean call? */
+    bool in_clean_call;
 } translate_walk_t;
 
 static void
@@ -170,7 +172,8 @@ instr_is_rseq_mangling(dcontext_t *dcontext, instr_t *inst)
     if (vmvector_empty(d_r_rseq_areas))
         return false;
     /* XXX: Keep this consistent with mangle_rseq_* in mangle_shared.c. */
-    if (instr_get_opcode(inst) == IF_X86_ELSE(OP_mov_ld, OP_ldr) &&
+    if (instr_get_opcode(inst) ==
+            IF_X86_ELSE(OP_mov_ld, IF_RISCV64_ELSE(OP_lw, OP_ldr)) &&
         opnd_is_reg(instr_get_dst(inst, 0)) &&
         opnd_is_base_disp(instr_get_src(inst, 0))) {
         reg_id_t dst = opnd_get_reg(instr_get_dst(inst, 0));
@@ -182,7 +185,8 @@ instr_is_rseq_mangling(dcontext_t *dcontext, instr_t *inst)
                 offsetof(dcontext_t, rseq_entry_state) +
                     sizeof(reg_t) * (dst - DR_REG_START_GPR))
             return true;
-    } else if (instr_get_opcode(inst) == IF_X86_ELSE(OP_mov_st, OP_str) &&
+    } else if (instr_get_opcode(inst) ==
+                   IF_X86_ELSE(OP_mov_st, IF_RISCV64_ELSE(OP_sw, OP_str)) &&
                opnd_is_reg(instr_get_src(inst, 0)) &&
                opnd_is_base_disp(instr_get_dst(inst, 0))) {
         reg_id_t dst = opnd_get_reg(instr_get_src(inst, 0));
@@ -343,6 +347,12 @@ translate_walk_track_post_instr(dcontext_t *tdcontext, instr_t *inst,
     reg_id_t reg, r;
     bool spill, spill_tls;
 
+    if (instr_is_label(inst)) {
+        if (instr_get_note(inst) == (void *)DR_NOTE_CALL_SEQUENCE_START)
+            walk->in_clean_call = true;
+        else if (instr_get_note(inst) == (void *)DR_NOTE_CALL_SEQUENCE_END)
+            walk->in_clean_call = false;
+    }
     if (instr_is_our_mangling(inst)) {
         if (!walk->in_mangle_region) {
             walk->in_mangle_region = true;
@@ -359,12 +369,12 @@ translate_walk_track_post_instr(dcontext_t *tdcontext, instr_t *inst,
                 walk->translation);
         } else
             ASSERT(walk->translation == instr_get_translation(inst));
-        /* PR 302951: we recognize a clean call by its NULL translation.
+        /* We recognize a clean call by explicit labels or flags.
          * We do not track any stack or spills: we assume we will only
          * fault on an argument that references app memory, in which case
          * we restore to the priv_mcontext_t on the stack.
          */
-        if (walk->translation == NULL) {
+        if (walk->in_clean_call) {
             DOLOG(4, LOG_INTERP, {
                 d_r_loginst(get_thread_private_dcontext(), 4, inst,
                             "\tin clean call arg region");
@@ -389,6 +399,9 @@ translate_walk_track_post_instr(dcontext_t *tdcontext, instr_t *inst,
          * comment above for post-mangling traces), and so for local
          * spills like rip-rel and ind branches this is fine.
          */
+#if defined(RISCV64)
+        ASSERT_NOT_IMPLEMENTED(false);
+#endif
         if (instr_is_cti(inst) &&
 #ifdef X86
             /* Do not reset for a trace-cmp jecxz or jmp (32-bit) or
@@ -407,6 +420,9 @@ translate_walk_track_post_instr(dcontext_t *tdcontext, instr_t *inst,
               (!opnd_is_pc(instr_get_target(inst)) ||
                (opnd_get_pc(instr_get_target(inst)) >= walk->start_cache &&
                 opnd_get_pc(instr_get_target(inst)) < walk->end_cache))))
+#elif defined(RISCV64)
+            /* FIXME i#3544: Not implemented */
+            false
 #else
             /* Do not reset for cbnz/bne in ldstex mangling, nor for the b after strex. */
             !(instr_get_opcode(inst) == OP_cbnz ||
@@ -420,6 +436,8 @@ translate_walk_track_post_instr(dcontext_t *tdcontext, instr_t *inst,
         ) {
             /* FIXME i#1551: add ARM version of the series of trace cti checks above */
             IF_ARM(ASSERT_NOT_IMPLEMENTED(DYNAMO_OPTION(disable_traces)));
+            /* FIXME i#3544: Implement traces */
+            IF_RISCV64(ASSERT_NOT_IMPLEMENTED(DYNAMO_OPTION(disable_traces)));
             /* reset for non-exit non-trace-jecxz cti (i.e., selfmod cti) */
             LOG(THREAD_GET, LOG_INTERP, 4, "\treset spills on cti\n");
             for (r = 0; r < REG_SPILL_NUM; r++)
@@ -693,9 +711,7 @@ translate_walk_restore(dcontext_t *tdcontext, translate_walk_t *walk, instr_t *i
 static void
 translate_restore_clean_call(dcontext_t *tdcontext, translate_walk_t *walk)
 {
-    /* PR 302951: we recognize a clean call by its combination of
-     * our-mangling and NULL translation.
-     * We restore to the priv_mcontext_t that was pushed on the stack.
+    /* We restore to the priv_mcontext_t that was pushed on the stack.
      * FIXME i#4219: This is not safe: see comment below.
      */
     LOG(THREAD_GET, LOG_INTERP, 2, "\ttranslating clean call arg crash\n");
@@ -756,7 +772,7 @@ recreate_app_state_from_info(dcontext_t *tdcontext, const translation_info_t *in
     byte *cpc, *prev_cpc;
     cache_pc target_cache = mc->pc;
     uint i;
-    bool contig = true, ours = false;
+    bool contig = true, ours = false, in_clean_call = false;
     recreate_success_t res = (just_pc ? RECREATE_SUCCESS_PC : RECREATE_SUCCESS_STATE);
     instr_t instr;
     translate_walk_t walk;
@@ -783,6 +799,8 @@ recreate_app_state_from_info(dcontext_t *tdcontext, const translation_info_t *in
     ASSERT(cpc - start_cache == info->translation[0].cache_offs);
     i = 0;
     while (cpc < end_cache) {
+        LOG(THREAD_GET, LOG_INTERP, 5, "cache pc " PFX " vs " PFX "\n", cpc,
+            target_cache);
         /* we can go beyond the end of the table: then use the last point */
         if (i < info->num_entries &&
             cpc - start_cache >= info->translation[i].cache_offs) {
@@ -790,6 +808,7 @@ recreate_app_state_from_info(dcontext_t *tdcontext, const translation_info_t *in
             answer = info->translation[i].app;
             contig = !TEST(TRANSLATE_IDENTICAL, info->translation[i].flags);
             ours = TEST(TRANSLATE_OUR_MANGLING, info->translation[i].flags);
+            in_clean_call = TEST(TRANSLATE_CLEAN_CALL, info->translation[i].flags);
             i++;
         }
 
@@ -824,6 +843,8 @@ recreate_app_state_from_info(dcontext_t *tdcontext, const translation_info_t *in
         instr_set_translation(&instr, answer);
         translate_walk_track_pre_instr(tdcontext, &instr, &walk);
         translate_walk_track_post_instr(tdcontext, &instr, &walk);
+        /* We directly set this field rather than inserting synthetic labels. */
+        walk.in_clean_call = in_clean_call;
 
         /* advance translation by the stride: either instr length or 0 */
         if (contig)
@@ -850,7 +871,7 @@ recreate_app_state_from_info(dcontext_t *tdcontext, const translation_info_t *in
          * xl8 we could be before setup or after teardown of the mcontext on the
          * dstack, and with leaner clean calls we might not have the full mcontext.
          */
-        if (answer == NULL && ours)
+        if (answer == NULL && walk.in_clean_call)
             translate_restore_clean_call(tdcontext, &walk);
         else
             res = RECREATE_SUCCESS_PC; /* failed on full state, but pc good */
@@ -1011,7 +1032,7 @@ recreate_app_state_from_ilist(dcontext_t *tdcontext, instrlist_t *ilist, byte *s
                 /* PR 302951: our clean calls do show up here and have full state.
                  * FIXME i#4219: This is not safe: see comment above.
                  */
-                if (instr_is_our_mangling(inst))
+                if (walk.in_clean_call)
                     translate_restore_clean_call(tdcontext, &walk);
                 else
                     res = RECREATE_SUCCESS_PC; /* failed on full state, but pc good */
@@ -1268,7 +1289,7 @@ recreate_app_state_internal(dcontext_t *tdcontext, priv_mcontext_t *mcontext,
             LOG(THREAD_GET, LOG_INTERP | LOG_SYNCH, 2,
                 "recreate_app: no PC translation needed (at vsyscall)\n");
         }
-#    ifdef MACOS
+#    if defined(MACOS) && defined(X86)
         if (!just_pc) {
             LOG(THREAD_GET, LOG_INTERP | LOG_SYNCH, 2,
                 "recreate_app: restoring xdx (at sysenter)\n");
@@ -1362,7 +1383,7 @@ recreate_app_state_internal(dcontext_t *tdcontext, priv_mcontext_t *mcontext,
         cache_pc cti_pc;
         instrlist_t *ilist = NULL;
         fragment_t *f = owning_f;
-        bool alloc = false, ok;
+        bool alloc = false;
         dr_isa_mode_t old_mode;
 #ifdef WINDOWS
         bool swap_peb = false;
@@ -1472,7 +1493,8 @@ recreate_app_state_internal(dcontext_t *tdcontext, priv_mcontext_t *mcontext,
         }
 
         /* Recreate in same mode as original fragment */
-        ok = dr_set_isa_mode(tdcontext, FRAG_ISA_MODE(f->flags), &old_mode);
+        DEBUG_DECLARE(bool ok =)
+        dr_set_isa_mode(tdcontext, FRAG_ISA_MODE(f->flags), &old_mode);
         ASSERT(ok);
 
         /* now recreate the state */
@@ -1494,7 +1516,7 @@ recreate_app_state_internal(dcontext_t *tdcontext, priv_mcontext_t *mcontext,
                 (byte *)f->start_pc + f->size, mcontext, just_pc, f->flags);
             STATS_INC(recreate_via_app_ilist);
         }
-        ok = dr_set_isa_mode(tdcontext, old_mode, NULL);
+        DEBUG_DECLARE(ok =) dr_set_isa_mode(tdcontext, old_mode, NULL);
         ASSERT(ok);
 
         if (!just_pc)
@@ -1677,7 +1699,7 @@ translation_info_free(dcontext_t *dcontext, translation_info_t *info)
 static inline void
 set_translation(dcontext_t *dcontext, translation_entry_t **entries, uint *num_entries,
                 uint entry, ushort cache_offs, app_pc app, bool identical,
-                bool our_mangling)
+                bool our_mangling, bool in_clean_call)
 {
     if (entry >= *num_entries) {
         /* alloc new arrays 2x as big */
@@ -1693,9 +1715,11 @@ set_translation(dcontext_t *dcontext, translation_entry_t **entries, uint *num_e
         (*entries)[entry].flags |= TRANSLATE_IDENTICAL;
     if (our_mangling)
         (*entries)[entry].flags |= TRANSLATE_OUR_MANGLING;
-    LOG(THREAD, LOG_FRAGMENT, 4, "\tset_translation: %d +%5d => " PFX " %s%s\n", entry,
+    if (in_clean_call)
+        (*entries)[entry].flags |= TRANSLATE_CLEAN_CALL;
+    LOG(THREAD, LOG_FRAGMENT, 4, "\tset_translation: %d +%5d => " PFX " %s%s%s\n", entry,
         cache_offs, app, identical ? "identical" : "contiguous",
-        our_mangling ? " ours" : "");
+        our_mangling ? " ours" : "", in_clean_call ? " call" : "");
 }
 
 void
@@ -1706,13 +1730,14 @@ translation_info_print(const translation_info_t *info, cache_pc start, file_t fi
     ASSERT(file != INVALID_FILE);
     print_file(file, "translation info " PFX "\n", info);
     for (i = 0; i < info->num_entries; i++) {
-        print_file(file, "\t%d +%5d == " PFX " => " PFX " %s%s\n", i,
+        print_file(file, "\t%d +%5d == " PFX " => " PFX " %s%s%s\n", i,
                    info->translation[i].cache_offs,
                    start + info->translation[i].cache_offs, info->translation[i].app,
                    TEST(TRANSLATE_IDENTICAL, info->translation[i].flags) ? "identical"
                                                                          : "contiguous",
                    TEST(TRANSLATE_OUR_MANGLING, info->translation[i].flags) ? " ours"
-                                                                            : "");
+                                                                            : "",
+                   TEST(TRANSLATE_CLEAN_CALL, info->translation[i].flags) ? " call" : "");
     }
 }
 
@@ -1776,7 +1801,7 @@ record_translation_info(dcontext_t *dcontext, fragment_t *f, instrlist_t *existi
     if (fragment_prefix_size(f->flags) > 0) {
         ASSERT(f->start_pc < cpc);
         set_translation(dcontext, &entries, &num_entries, i, 0, f->tag,
-                        true /*identical*/, true /*our mangling*/);
+                        true /*identical*/, true /*our mangling*/, false /*!call*/);
         last_translation = f->tag;
         last_contig = false;
         i++;
@@ -1784,6 +1809,7 @@ record_translation_info(dcontext_t *dcontext, fragment_t *f, instrlist_t *existi
         ASSERT(f->start_pc == cpc);
         last_contig = true; /* we create 1st entry on 1st loop iter */
     }
+    bool in_clean_call = false;
     for (inst = instrlist_first(ilist); inst; inst = instr_get_next(inst)) {
         app_pc app = instr_get_translation(inst);
         uint prev_i = i;
@@ -1791,9 +1817,14 @@ record_translation_info(dcontext_t *dcontext, fragment_t *f, instrlist_t *existi
          * We preserve the NULL so our translation routines know to not
          * let this be a thread relocation point
          */
-        /* i#739, skip label instr */
-        if (instr_is_label(inst))
+        if (instr_is_label(inst)) {
+            if (instr_get_note(inst) == (void *)DR_NOTE_CALL_SEQUENCE_START)
+                in_clean_call = true;
+            else if (instr_get_note(inst) == (void *)DR_NOTE_CALL_SEQUENCE_END)
+                in_clean_call = false;
+            /* i#739, skip label instr */
             continue;
+        }
         /* PR 302951: clean call args are instr_is_our_mangling so no assert for that */
         ASSERT(app != NULL || instr_is_meta(inst));
         /* see whether we need a new entry, or the current stride (contig
@@ -1821,7 +1852,7 @@ record_translation_info(dcontext_t *dcontext, fragment_t *f, instrlist_t *existi
                 } else {
                     set_translation(dcontext, &entries, &num_entries, i,
                                     (ushort)(cpc - f->start_pc), app, true /*identical*/,
-                                    instr_is_our_mangling(inst));
+                                    instr_is_our_mangling(inst), in_clean_call);
                     i++;
                 }
                 last_contig = false;
@@ -1832,7 +1863,7 @@ record_translation_info(dcontext_t *dcontext, fragment_t *f, instrlist_t *existi
                  */
                 set_translation(dcontext, &entries, &num_entries, i,
                                 (ushort)(cpc - f->start_pc), app, false /*contig*/,
-                                instr_is_our_mangling(inst));
+                                instr_is_our_mangling(inst), in_clean_call);
                 last_contig = true;
                 i++;
             } /* else, contig continues */
@@ -1855,7 +1886,7 @@ record_translation_info(dcontext_t *dcontext, fragment_t *f, instrlist_t *existi
                     /* probably a follow-ubr, so create a new contig entry */
                     set_translation(dcontext, &entries, &num_entries, i,
                                     (ushort)(cpc - f->start_pc), app, false /*contig*/,
-                                    instr_is_our_mangling(inst));
+                                    instr_is_our_mangling(inst), in_clean_call);
                     last_contig = true;
                     i++;
                 }
@@ -1863,15 +1894,17 @@ record_translation_info(dcontext_t *dcontext, fragment_t *f, instrlist_t *existi
         }
         last_translation = app;
 
-        /* We need to make a new entry if the our-mangling flag changed */
+        /* We need to make a new entry if the flags changed. */
         if (i > 0 && i == prev_i &&
-            instr_is_our_mangling(inst) !=
-                TEST(TRANSLATE_OUR_MANGLING, entries[i - 1].flags)) {
+            (!BOOLS_MATCH(instr_is_our_mangling(inst),
+                          TEST(TRANSLATE_OUR_MANGLING, entries[i - 1].flags)) ||
+             !BOOLS_MATCH(in_clean_call,
+                          TEST(TRANSLATE_CLEAN_CALL, entries[i - 1].flags)))) {
             /* our manglings are usually identical */
             bool identical = instr_is_our_mangling(inst);
             set_translation(dcontext, &entries, &num_entries, i,
                             (ushort)(cpc - f->start_pc), app, identical,
-                            instr_is_our_mangling(inst));
+                            instr_is_our_mangling(inst), in_clean_call);
             last_contig = !identical;
             i++;
         }
@@ -1907,11 +1940,11 @@ stress_test_recreate_state(dcontext_t *dcontext, fragment_t *f, instrlist_t *ili
     priv_mcontext_t mc;
     bool res;
     cache_pc cpc;
-    instr_t *in, *prev_in = NULL;
+    instr_t *in;
     static const reg_t STRESS_XSP_INIT = 0x08000000; /* arbitrary */
     bool success_so_far = true;
     bool inside_mangle_region = false;
-    bool inside_mangle_epilogue = false;
+    IF_X86(bool inside_mangle_epilogue = false;)
     uint spill_ibreg_outstanding_offs = UINT_MAX;
     reg_id_t reg;
     bool spill;
@@ -1947,13 +1980,12 @@ stress_test_recreate_state(dcontext_t *dcontext, fragment_t *f, instrlist_t *ili
             /* reset */
             LOG(THREAD, LOG_INTERP, 3, "  out of mangling region\n");
             inside_mangle_region = false;
-            inside_mangle_epilogue = false;
+            IF_X86(inside_mangle_epilogue = false;)
             xsp_adjust = 0;
             success_so_far = true;
             spill_ibreg_outstanding_offs = UINT_MAX;
             /* go ahead and fall through and ensure we succeed w/ 0 xsp adjust */
         }
-        prev_in = in;
 
         if (instr_is_our_mangling(in)) {
             if (!inside_mangle_region) {
@@ -1964,7 +1996,7 @@ stress_test_recreate_state(dcontext_t *dcontext, fragment_t *f, instrlist_t *ili
                                        instr_is_our_mangling_epilogue(in),
                                    false)) {
                 LOG(THREAD, LOG_INTERP, 3, "  entering mangling epilogue\n");
-                inside_mangle_epilogue = true;
+                IF_X86(inside_mangle_epilogue = true;)
             } else {
                 ASSERT(!TEST(FRAG_IS_TRACE, f->flags) ||
                        IF_X86(instr_is_our_mangling_epilogue(in) ||)
@@ -1972,13 +2004,10 @@ stress_test_recreate_state(dcontext_t *dcontext, fragment_t *f, instrlist_t *ili
             }
 
             if (spill_ibreg_outstanding_offs != UINT_MAX) {
-                mc.IF_X86_ELSE(xcx, r2) =
-                    (reg_t)d_r_get_tls(spill_ibreg_outstanding_offs) + 1;
+                mc.MC_IBL_REG = (reg_t)d_r_get_tls(spill_ibreg_outstanding_offs) + 1;
             } else {
-                mc.IF_X86_ELSE(xcx, r2) =
-                    (reg_t)d_r_get_tls(os_tls_offset(
-                        (ushort)reg_spill_tls_offs(IF_X86_ELSE(DR_REG_XCX, DR_REG_R2)))) +
-                    1;
+                mc.MC_IBL_REG =
+                    (reg_t)d_r_get_tls(os_tls_offset((ushort)IBL_TARGET_SLOT)) + 1;
             }
             mc.xsp = STRESS_XSP_INIT;
             mc.pc = cpc;
@@ -1994,9 +2023,7 @@ stress_test_recreate_state(dcontext_t *dcontext, fragment_t *f, instrlist_t *ili
                 "  restored res=%d pc=" PFX ", xsp=" PFX " vs " PFX ", ibreg=" PFX
                 " vs " PFX "\n",
                 res, mc.pc, mc.xsp, STRESS_XSP_INIT - /*negate*/ xsp_adjust,
-                mc.IF_X86_ELSE(xcx, r2),
-                d_r_get_tls(os_tls_offset(
-                    (ushort)reg_spill_tls_offs(IF_X86_ELSE(DR_REG_XCX, DR_REG_R2)))));
+                mc.MC_IBL_REG, d_r_get_tls(os_tls_offset((ushort)IBL_TARGET_SLOT)));
             /* We should only have failures at tail end of mangle regions.
              * No instrs after a failing instr should touch app memory.
              */
@@ -2009,8 +2036,7 @@ stress_test_recreate_state(dcontext_t *dcontext, fragment_t *f, instrlist_t *ili
             /* check that xsp and ibreg are adjusted properly */
             ASSERT(mc.xsp == STRESS_XSP_INIT - /*negate*/ xsp_adjust);
             ASSERT(spill_ibreg_outstanding_offs == UINT_MAX ||
-                   mc.IF_X86_ELSE(xcx, r2) ==
-                       (reg_t)d_r_get_tls(spill_ibreg_outstanding_offs));
+                   mc.MC_IBL_REG == (reg_t)d_r_get_tls(spill_ibreg_outstanding_offs));
 
             if (success_so_far && !res)
                 success_so_far = false;
@@ -2020,7 +2046,7 @@ stress_test_recreate_state(dcontext_t *dcontext, fragment_t *f, instrlist_t *ili
             uint offs = UINT_MAX;
             if (instr_is_DR_reg_spill_or_restore(dcontext, in, NULL, &spill, &reg,
                                                  &offs) &&
-                reg == IF_X86_ELSE(DR_REG_XCX, DR_REG_R2)) {
+                reg == IBL_TARGET_REG) {
                 if (spill)
                     spill_ibreg_outstanding_offs = offs;
                 else

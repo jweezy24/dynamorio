@@ -1,5 +1,5 @@
 # **********************************************************
-# Copyright (c) 2012-2021 Google, Inc.    All rights reserved.
+# Copyright (c) 2012-2022 Google, Inc.    All rights reserved.
 # Copyright (c) 2009-2010 VMware, Inc.    All rights reserved.
 # **********************************************************
 
@@ -56,6 +56,8 @@ endforeach (dir)
 
 # Add drcachesim dirs (i#2006).
 set(ext_dirs ${ext_dirs} "${proj_bindir}/clients/include/drmemtrace")
+# Add drpt2trace dirs
+set(ext_dirs ${ext_dirs} "${proj_srcdir}/clients/drcachesim/drpt2trace")
 
 include("${srcdir}/CMake_doxyutils.cmake")
 set(input_paths srcdir proj_srcdir header_dir gendox_dir outdir)
@@ -125,6 +127,11 @@ string(REGEX REPLACE
 string(REGEX REPLACE
   "(footer.html)"
   "\"${dest_dir}/\\1\"" string "${string}")
+
+# If we end up with more of these we should generalize and pass them in
+# rather than hardcoding here.
+string(APPEND string
+  "HTML_EXTRA_FILES=${proj_bindir}/clients/drcachesim/docs/new-features-encodings-seek.pdf")
 
 if (doxygen_ver STRGREATER "1.7.2")
   # For 1.7.3+ we use xml file to tweak treeview contents

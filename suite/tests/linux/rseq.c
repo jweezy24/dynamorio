@@ -1,5 +1,5 @@
 /* **********************************************************
- * Copyright (c) 2019-2022 Google, Inc.  All rights reserved.
+ * Copyright (c) 2019-2023 Google, Inc.  All rights reserved.
  * **********************************************************/
 
 /*
@@ -39,6 +39,7 @@
 #    include "thread.h"
 #    include "condvar.h"
 #    include <stdatomic.h>
+#    include "drmemtrace/drmemtrace.h"
 #endif
 #ifndef LINUX
 #    error Only Linux is supported.
@@ -57,6 +58,12 @@
 #    define _GNU_SOURCE
 #endif
 #include <sched.h>
+#if defined(__GLIBC__) && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 35))
+#    include <sys/rseq.h>
+#    define GLIBC_RSEQ 1
+#else
+#    define RSEQ_SIG IF_X86_ELSE(0x90909090, 0xd503201f) /* nops to disasm nicely */
+#endif
 #include <linux/rseq.h>
 #include <errno.h>
 #undef NDEBUG
@@ -65,7 +72,6 @@
 #define EXPANDSTR(x) #x
 #define STRINGIFY(x) EXPANDSTR(x)
 
-#define RSEQ_SIG IF_X86_ELSE(0x90909090, 0xd503201f) /* nops to disasm nicely */
 #ifdef RSEQ_TEST_USE_OLD_SECTION_NAME
 #    define RSEQ_SECTION_NAME "__rseq_table"
 #else
@@ -97,7 +103,7 @@ static __thread volatile struct rseq rseq_tls;
 static __thread volatile struct rseq fill_up_tls[128];
 
 extern void
-test_rseq_native_abort_pre_commit();
+test_rseq_native_abort_handler();
 
 #ifdef RSEQ_TEST_ATTACH
 static atomic_int exit_requested;
@@ -105,6 +111,70 @@ static void *thread_ready;
 #endif
 
 static volatile int sigill_count;
+static volatile bool in_rseq_migration_test;
+
+static bool
+register_rseq()
+{
+#ifdef GLIBC_RSEQ
+    if (__rseq_size > 0) {
+        /* Our glibc rseq handling in rseq_linux.c checks the following offset
+         * first for the glibc-registered struct rseq. Though we do have a
+         * fallback that does a wider search, it would be good to keep the
+         * expected offset in sync with glibc changes.
+         */
+#    if __GLIBC__ == 2 && __GLIBC_MINOR__ >= 36
+#        ifdef X86
+#            ifdef X64
+        assert(__rseq_offset == 2336);
+#            else
+        assert(__rseq_offset == 1184);
+#            endif
+#        else
+        /* Did not change on glibc 2.36. */
+        assert(__rseq_offset == -32);
+#        endif
+#    else
+#        ifdef X86
+#            ifdef X64
+        assert(__rseq_offset == 2464);
+#            else
+        assert(__rseq_offset == 1312);
+#            endif
+#        else
+        assert(__rseq_offset == -32);
+#        endif
+#    endif
+        /* Already registered by glibc. Verify that it's there. */
+        struct rseq *reg_rseq = __builtin_thread_pointer() + __rseq_offset;
+        /* Glibc uses RSEQ_SIG as the signature. The following will return
+         * EBUSY if reg_rseq is the registered struct rseq and EINVAL otherwise.
+         * FTR: if we use some other value as signature (like zero),  this
+         * becomes an EPERM vs EINVAL check.
+         */
+        int res = syscall(SYS_rseq, reg_rseq, sizeof(*reg_rseq), 0, RSEQ_SIG);
+        assert(res == -1 && (errno == EBUSY || errno == ENOSYS));
+    } else {
+#endif
+        rseq_tls.cpu_id = RSEQ_CPU_ID_UNINITIALIZED;
+        int res = syscall(SYS_rseq, &rseq_tls, sizeof(rseq_tls), 0, RSEQ_SIG);
+        assert(res == 0 || (res == -1 && errno == ENOSYS));
+#ifdef GLIBC_RSEQ
+    }
+#endif
+    /* Linux kernel 4.18+ is required. */
+    return errno != ENOSYS;
+}
+
+static volatile struct rseq *
+get_my_rseq()
+{
+#ifdef GLIBC_RSEQ
+    if (__rseq_size > 0)
+        return (struct rseq *)(__builtin_thread_pointer() + __rseq_offset);
+#endif
+    return &rseq_tls;
+}
 
 static void
 signal_handler(int sig, siginfo_t *siginfo, ucontext_t *ucxt)
@@ -116,6 +186,7 @@ signal_handler(int sig, siginfo_t *siginfo, ucontext_t *ucxt)
 static void
 test_rseq_call_once(bool force_restart_in, int *completions_out, int *restarts_out)
 {
+    volatile struct rseq *reg_rseq = get_my_rseq();
     /* We use static to avoid stack reference issues with our extra frame inside the asm.
      */
     static __u32 id = RSEQ_CPU_ID_UNINITIALIZED;
@@ -140,9 +211,14 @@ test_rseq_call_once(bool force_restart_in, int *completions_out, int *restarts_o
         "6:\n\t"
         /* Store the entry into the ptr. */
         "leaq rseq_cs_simple(%%rip), %%rax\n\t"
-        "movq %%rax, %[rseq_tls]\n\t"
-        /* Test a register input to the sequence. */
+        "movq %%rax, %[rseq_cs]\n\t"
+        /* Test register inputs to the sequence. */
         "movl %[cpu_id], %%eax\n\t"
+        "movq %%rsp, %%rcx\n\t"
+        "movq %%rsp, %%rdx\n\t"
+        "movq %%rsp, %%rbx\n\t"
+        "movq %%rsp, %%rdi\n\t"
+        "movq %%rsp, %%rsi\n\t"
         /* Test "falling into" the rseq region. */
 
         /* Restartable sequence. */
@@ -150,6 +226,15 @@ test_rseq_call_once(bool force_restart_in, int *completions_out, int *restarts_o
         "movl %%eax, %[id]\n\t"
         /* Test clobbering an input register. */
         "movl %[cpu_id_uninit], %%eax\n\t"
+        /* Test reading many registers to stress drreg (e.g., i#5668).
+         * This is easier in x86 where we can exhaust drreg's choices.
+         * We do not attempt on aarch64 for simplicity.
+         */
+        "movq (%%rcx), %%rax\n\t"
+        "movq (%%rdx), %%rax\n\t"
+        "movq (%%rbx), %%rax\n\t"
+        "movq (%%rdi), %%rax\n\t"
+        "movq (%%rsi), %%rax\n\t"
         /* Test a restart in the middle of the sequence via ud2a SIGILL. */
         "cmpb $0, %[force_restart]\n\t"
         "jz 7f\n\t"
@@ -178,15 +263,14 @@ test_rseq_call_once(bool force_restart_in, int *completions_out, int *restarts_o
 
         /* Clear the ptr. */
         "5:\n\t"
-        "movq $0, %[rseq_tls]\n\t"
+        "movq $0, %[rseq_cs]\n\t"
         /* clang-format on */
-        : [ rseq_tls ] "=m"(rseq_tls.rseq_cs), [ id ] "=m"(id),
-          [ completions ] "=m"(completions), [ restarts ] "=m"(restarts),
-          [ force_restart_write ] "=m"(force_restart)
-        : [ cpu_id ] "m"(rseq_tls.cpu_id),
-          [ cpu_id_uninit ] "i"(RSEQ_CPU_ID_UNINITIALIZED),
-          [ force_restart ] "m"(force_restart)
-        : "rax", "memory");
+        : [rseq_cs] "=m"(reg_rseq->rseq_cs), [id] "=m"(id),
+          [completions] "=m"(completions), [restarts] "=m"(restarts),
+          [force_restart_write] "=m"(force_restart)
+        : [cpu_id] "m"(reg_rseq->cpu_id), [cpu_id_uninit] "i"(RSEQ_CPU_ID_UNINITIALIZED),
+          [force_restart] "m"(force_restart)
+        : "rax", "rcx", "rdx", "rbx", "rdi", "rsi", "memory");
 #elif defined(AARCH64)
     __asm__ __volatile__(
         RSEQ_ADD_TABLE_ENTRY(simple, 2f, 3f, 4f)
@@ -204,7 +288,7 @@ test_rseq_call_once(bool force_restart_in, int *completions_out, int *restarts_o
          * inputs but that's simpler than manually computing all these
          * addresses inside the sequence.
          */
-        "str x0, %[rseq_tls]\n\t"
+        "str x0, %[rseq_cs]\n\t"
         /* Test a register input to the sequence. */
         "ldr x0, %[cpu_id]\n\t"
         /* Test "falling into" the rseq region. */
@@ -214,6 +298,10 @@ test_rseq_call_once(bool force_restart_in, int *completions_out, int *restarts_o
         "str x0, %[id]\n\t"
         /* Test clobbering an input register. */
         "mov x0, #%[cpu_id_uninit]\n\t"
+        /* Test clobbering a non-regular-GPR. */
+        "mov x1, sp\n\t"
+        "mov sp, x0\n\t"
+        "mov sp, x1\n\t"
         /* Test a restart in the middle of the sequence via udf SIGILL. */
         "ldrb w0, %[force_restart]\n\t"
         "cbz x0, 7f\n\t"
@@ -244,14 +332,13 @@ test_rseq_call_once(bool force_restart_in, int *completions_out, int *restarts_o
 
         /* Clear the ptr. */
         "5:\n\t"
-        "str xzr, %[rseq_tls]\n\t"
+        "str xzr, %[rseq_cs]\n\t"
         /* clang-format on */
-        : [ rseq_tls ] "=m"(rseq_tls.rseq_cs), [ id ] "=m"(id),
-          [ completions ] "=m"(completions), [ restarts ] "=m"(restarts),
-          [ force_restart_write ] "=m"(force_restart)
-        : [ cpu_id ] "m"(rseq_tls.cpu_id),
-          [ cpu_id_uninit ] "i"(RSEQ_CPU_ID_UNINITIALIZED),
-          [ force_restart ] "m"(force_restart)
+        : [rseq_cs] "=m"(reg_rseq->rseq_cs), [id] "=m"(id),
+          [completions] "=m"(completions), [restarts] "=m"(restarts),
+          [force_restart_write] "=m"(force_restart)
+        : [cpu_id] "m"(reg_rseq->cpu_id), [cpu_id_uninit] "i"(RSEQ_CPU_ID_UNINITIALIZED),
+          [force_restart] "m"(force_restart)
         : "x0", "x1", "memory");
 #else
 #    error Unsupported arch
@@ -277,6 +364,7 @@ test_rseq_call(void)
 static void
 test_rseq_branches_once(bool force_restart, int *completions_out, int *restarts_out)
 {
+    volatile struct rseq *reg_rseq = get_my_rseq();
     __u32 id = RSEQ_CPU_ID_UNINITIALIZED;
     int completions = 0;
     int restarts = 0;
@@ -289,7 +377,7 @@ test_rseq_branches_once(bool force_restart, int *completions_out, int *restarts_
         "6:\n\t"
         /* Store the entry into the ptr. */
         "leaq rseq_cs_branches(%%rip), %%rax\n\t"
-        "movq %%rax, %[rseq_tls]\n\t"
+        "movq %%rax, %[rseq_cs]\n\t"
         /* Test a register input to the sequence. */
         "movl %[cpu_id], %%eax\n\t"
         /* Test "falling into" the rseq region. */
@@ -337,13 +425,13 @@ test_rseq_branches_once(bool force_restart, int *completions_out, int *restarts_
         "13:\n\t"
         "12:\n\t"
         "5:\n\t"
-        "movq $0, %[rseq_tls]\n\t"
+        "movq $0, %[rseq_cs]\n\t"
         /* clang-format on */
 
-        : [ rseq_tls ] "=m"(rseq_tls.rseq_cs), [ id ] "=m"(id),
-          [ completions ] "=m"(completions), [ restarts ] "=m"(restarts),
-          [ force_restart_write ] "=m"(force_restart)
-        : [ cpu_id ] "m"(rseq_tls.cpu_id), [ force_restart ] "m"(force_restart)
+        : [rseq_cs] "=m"(reg_rseq->rseq_cs), [id] "=m"(id),
+          [completions] "=m"(completions), [restarts] "=m"(restarts),
+          [force_restart_write] "=m"(force_restart)
+        : [cpu_id] "m"(reg_rseq->cpu_id), [force_restart] "m"(force_restart)
         : "rax", "rcx", "memory");
 #elif defined(AARCH64)
     __asm__ __volatile__(
@@ -355,7 +443,7 @@ test_rseq_branches_once(bool force_restart, int *completions_out, int *restarts_
         /* Store the entry into the ptr. */
         "adrp x0, rseq_cs_branches\n\t"
         "add x0, x0, :lo12:rseq_cs_branches\n\t"
-        "str x0, %[rseq_tls]\n\t"
+        "str x0, %[rseq_cs]\n\t"
         /* Test a register input to the sequence. */
         "ldr x0, %[cpu_id]\n\t"
         /* Test "falling into" the rseq region. */
@@ -407,18 +495,20 @@ test_rseq_branches_once(bool force_restart, int *completions_out, int *restarts_
         "13:\n\t"
         "12:\n\t"
         "5:\n\t"
-        "str xzr, %[rseq_tls]\n\t"
+        "str xzr, %[rseq_cs]\n\t"
         /* clang-format on */
 
-        : [ rseq_tls ] "=m"(rseq_tls.rseq_cs), [ id ] "=m"(id),
-          [ completions ] "=m"(completions), [ restarts ] "=m"(restarts),
-          [ force_restart_write ] "=m"(force_restart)
-        : [ cpu_id ] "m"(rseq_tls.cpu_id), [ force_restart ] "m"(force_restart)
+        : [rseq_cs] "=m"(reg_rseq->rseq_cs), [id] "=m"(id),
+          [completions] "=m"(completions), [restarts] "=m"(restarts),
+          [force_restart_write] "=m"(force_restart)
+        : [cpu_id] "m"(reg_rseq->cpu_id), [force_restart] "m"(force_restart)
         : "x0", "x1", "memory");
 #else
 #    error Unsupported arch
 #endif
     assert(id != RSEQ_CPU_ID_UNINITIALIZED);
+    *completions_out = completions;
+    *restarts_out = restarts;
 }
 
 static void
@@ -444,6 +534,7 @@ test_rseq_branches(void)
 static void
 test_rseq_native_fault(void)
 {
+    volatile struct rseq *reg_rseq = get_my_rseq();
     int restarts = 0;
 #ifdef X86
     __asm__ __volatile__(
@@ -454,7 +545,7 @@ test_rseq_native_fault(void)
         "6:\n\t"
         /* Store the entry into the ptr. */
         "leaq rseq_cs_fault(%%rip), %%rax\n\t"
-        "movq %%rax, %[rseq_tls]\n\t"
+        "movq %%rax, %[rseq_cs]\n\t"
         "pxor %%xmm0, %%xmm0\n\t"
         "mov $1,%%rcx\n\t"
         "movq %%rcx, %%xmm1\n\t"
@@ -490,10 +581,10 @@ test_rseq_native_fault(void)
 
         /* Clear the ptr. */
         "5:\n\t"
-        "movq $0, %[rseq_tls]\n\t"
+        "movq $0, %[rseq_cs]\n\t"
         /* clang-format on */
 
-        : [ rseq_tls ] "=m"(rseq_tls.rseq_cs), [ restarts ] "=m"(restarts)
+        : [rseq_cs] "=m"(reg_rseq->rseq_cs), [restarts] "=m"(restarts)
         :
         : "rax", "rcx", "xmm0", "xmm1", "memory");
 #elif defined(AARCH64)
@@ -506,7 +597,7 @@ test_rseq_native_fault(void)
         /* Store the entry into the ptr. */
         "adrp x0, rseq_cs_fault\n\t"
         "add x0, x0, :lo12:rseq_cs_fault\n\t"
-        "str x0, %[rseq_tls]\n\t"
+        "str x0, %[rseq_cs]\n\t"
         "eor v0.16b, v0.16b, v0.16b\n\t"
         "mov x1, #1\n\t"
         "mov v1.D[0], x1\n\t"
@@ -544,10 +635,10 @@ test_rseq_native_fault(void)
 
         /* Clear the ptr. */
         "5:\n\t"
-        "str xzr, %[rseq_tls]\n\t"
+        "str xzr, %[rseq_cs]\n\t"
         /* clang-format on */
 
-        : [ rseq_tls ] "=m"(rseq_tls.rseq_cs), [ restarts ] "=m"(restarts)
+        : [rseq_cs] "=m"(reg_rseq->rseq_cs), [restarts] "=m"(restarts)
         :
         : "x0", "x1", "q0", "q1", "memory");
 #else
@@ -568,7 +659,9 @@ test_rseq_native_fault(void)
 static void
 test_rseq_native_abort(void)
 {
+    volatile struct rseq *reg_rseq = get_my_rseq();
 #ifdef DEBUG /* See above: special code in core/ is DEBUG-only> */
+    in_rseq_migration_test = true;
     int restarts = 0;
 #    ifdef X86
     __asm__ __volatile__(
@@ -579,7 +672,7 @@ test_rseq_native_abort(void)
         "6:\n\t"
         /* Store the entry into the ptr. */
         "leaq rseq_cs_abort(%%rip), %%rax\n\t"
-        "movq %%rax, %[rseq_tls]\n\t"
+        "movq %%rax, %[rseq_cs]\n\t"
         "pxor %%xmm0, %%xmm0\n\t"
         "mov $1,%%rcx\n\t"
         "movq %%rcx, %%xmm1\n\t"
@@ -607,8 +700,6 @@ test_rseq_native_abort(void)
         "leaq sched_mask_2(%%rip), %%rdx\n\t"
         "mov %[sysnum_setaffinity], %%eax\n\t"
         "syscall\n\t"
-        ".global test_rseq_native_abort_pre_commit\n\t"
-        "test_rseq_native_abort_pre_commit:\n\t"
         "11:\n\t"
         "nop\n\t"
 
@@ -620,6 +711,8 @@ test_rseq_native_abort(void)
         /* clang-format off */ /* (avoid indenting next few lines) */
         ".long " STRINGIFY(RSEQ_SIG) "\n\t"
         "4:\n\t"
+        ".global test_rseq_native_abort_handler\n\t"
+        "test_rseq_native_abort_handler:\n\t"
         "addl $1, %[restarts]\n\t"
         "jmp 2b\n\t"
 
@@ -630,13 +723,13 @@ test_rseq_native_abort(void)
 
         /* Clear the ptr. */
         "5:\n\t"
-        "movq $0, %[rseq_tls]\n\t"
+        "movq $0, %[rseq_cs]\n\t"
         /* clang-format on */
 
-        : [ rseq_tls ] "=m"(rseq_tls.rseq_cs), [ restarts ] "=m"(restarts)
-        : [ cpu_mask_size ] "i"(sizeof(cpu_set_t)),
-          [ sysnum_setaffinity ] "i"(SYS_sched_setaffinity)
-        : "rax", "rcx", "rdx", "xmm0", "xmm1", "memory");
+        : [rseq_cs] "=m"(reg_rseq->rseq_cs), [restarts] "=m"(restarts)
+        : [cpu_mask_size] "i"(sizeof(cpu_set_t)),
+          [sysnum_setaffinity] "i"(SYS_sched_setaffinity)
+        : "rax", "rcx", "rdx", "rsi", "rdi", "xmm0", "xmm1", "memory");
 #    elif defined(AARCH64)
     __asm__ __volatile__(
         /* clang-format off */ /* (avoid indenting next few lines) */
@@ -647,7 +740,7 @@ test_rseq_native_abort(void)
         /* Store the entry into the ptr. */
         "adrp x0, rseq_cs_abort\n\t"
         "add x0, x0, :lo12:rseq_cs_abort\n\t"
-        "str x0, %[rseq_tls]\n\t"
+        "str x0, %[rseq_cs]\n\t"
         "eor v0.16b, v0.16b, v0.16b\n\t"
         "mov x1, #1\n\t"
         "mov v1.D[0], x1\n\t"
@@ -677,10 +770,133 @@ test_rseq_native_abort(void)
         "add x2, x2, :lo12:sched_mask_2\n\t"
         "mov w8, #%[sysnum_setaffinity]\n\t"
         "svc #0\n\t"
-        ".global test_rseq_native_abort_pre_commit\n\t"
-        "test_rseq_native_abort_pre_commit:\n\t"
         "11:\n\t"
         "nop\n\t"
+
+        /* Post-commit. */
+        "3:\n\t"
+        "b 5f\n\t"
+
+        /* Abort handler. */
+        /* clang-format off */ /* (avoid indenting next few lines) */
+        ".long " STRINGIFY(RSEQ_SIG) "\n\t"
+        "4:\n\t"
+        ".global test_rseq_native_abort_handler\n\t"
+        "test_rseq_native_abort_handler:\n\t"
+        "ldr x1, %[restarts]\n\t"
+        "add x1, x1, #1\n\t"
+        "str x1, %[restarts]\n\t"
+        "b 2b\n\t"
+
+        ".balign 32\n\t"
+        "sched_mask_1:\n\t"
+        ".long 0x1, 0, 0, 0\n\t" /* cpu #1 */
+        "sched_mask_2:\n\t"
+        ".long 0x2, 0, 0, 0\n\t" /* cpu #2 */
+
+        /* Clear the ptr. */
+        "5:\n\t"
+        "str xzr, %[rseq_cs]\n\t"
+        /* clang-format on */
+
+        : [rseq_cs] "=m"(reg_rseq->rseq_cs), [restarts] "=m"(restarts)
+        : [cpu_mask_size] "i"(sizeof(cpu_set_t)),
+          [sysnum_setaffinity] "i"(SYS_sched_setaffinity)
+        : "x0", "x1", "x2", "x8", "q0", "q1", "memory");
+#    else
+#        error Unsupported arch
+#    endif
+    in_rseq_migration_test = false;
+    /* This is expected to fail on a native run where restarts will be 0. */
+    assert(restarts > 0);
+#endif /* DEBUG */
+}
+
+/* Tests that DR and drmemtrace handle a side exit in the native sequence. */
+static void
+test_rseq_side_exit(void)
+{
+    volatile struct rseq *reg_rseq = get_my_rseq();
+    int restarts = 0;
+    int commits = 0;
+#ifdef X86
+    __asm__ __volatile__(
+        /* clang-format off */ /* (avoid indenting next few lines) */
+        RSEQ_ADD_TABLE_ENTRY(side, 2f, 3f, 4f)
+        /* clang-format on */
+
+        "6:\n\t"
+        /* Store the entry into the ptr. */
+        "leaq rseq_cs_side(%%rip), %%rax\n\t"
+        "movq %%rax, %[rseq_cs]\n\t"
+        "pxor %%xmm0, %%xmm0\n\t"
+        "mov $1,%%rax\n\t"
+        "movq %%rax, %%xmm1\n\t"
+
+        /* Restartable sequence. */
+        "2:\n\t"
+        /* Increase xmm0 every time.  DR (currently) won't restore xmm inputs
+         * to rseq sequences, nor does it detect that it needs to.
+         */
+        "paddq %%xmm1,%%xmm0\n\t"
+        "movq %%xmm0, %%rax\n\t"
+        /* Take an inverted side exit in the 2nd run == native run. */
+        "cmp $2, %%rax\n\t"
+        "jne 7f\n\t"
+        "jmp 5f\n\t"
+        "7:\n\t"
+        "addl $1, %[commits]\n\t"
+
+        /* Post-commit. */
+        "3:\n\t"
+        "jmp 5f\n\t"
+
+        /* Abort handler. */
+        /* clang-format off */ /* (avoid indenting next few lines) */
+        ".long " STRINGIFY(RSEQ_SIG) "\n\t"
+        "4:\n\t"
+        "addl $1, %[restarts]\n\t"
+        "jmp 2b\n\t"
+
+        /* Clear the ptr. */
+        "5:\n\t"
+        "movq $0, %[rseq_cs]\n\t"
+        /* clang-format on */
+
+        : [rseq_cs] "=m"(reg_rseq->rseq_cs), [restarts] "=m"(restarts),
+          [commits] "=m"(commits)
+        :
+        : "rax", "xmm0", "xmm1", "memory");
+#elif defined(AARCH64)
+    __asm__ __volatile__(
+        /* clang-format off */ /* (avoid indenting next few lines) */
+        RSEQ_ADD_TABLE_ENTRY(side, 2f, 3f, 4f)
+        /* clang-format on */
+
+        "6:\n\t"
+        /* Store the entry into the ptr. */
+        "adrp x0, rseq_cs_side\n\t"
+        "add x0, x0, :lo12:rseq_cs_side\n\t"
+        "str x0, %[rseq_cs]\n\t"
+        "eor v0.16b, v0.16b, v0.16b\n\t"
+        "mov x0, #1\n\t"
+        "mov v1.D[0], x0\n\t"
+
+        /* Restartable sequence. */
+        "2:\n\t"
+        /* Increase xmm0 every time.  DR (currently) won't restore xmm inputs
+         * to rseq sequences, nor does it detect that it needs to.
+         */
+        "add d0, d0, d1\n\t"
+        "mov x0, v0.D[0]\n\t"
+        /* Take an inverted side exit in the 2nd run == native run. */
+        "cmp x0, #2\n\t"
+        "b.ne 7f\n\t"
+        "b 5f\n\t"
+        "7:\n\t"
+        "ldr x0, %[commits]\n\t"
+        "add x0, x0, #1\n\t"
+        "str x0, %[commits]\n\t"
 
         /* Post-commit. */
         "3:\n\t"
@@ -695,33 +911,27 @@ test_rseq_native_abort(void)
         "str x1, %[restarts]\n\t"
         "b 2b\n\t"
 
-        ".balign 32\n\t"
-        "sched_mask_1:\n\t"
-        ".long 0x1, 0, 0, 0\n\t" /* cpu #1 */
-        "sched_mask_2:\n\t"
-        ".long 0x2, 0, 0, 0\n\t" /* cpu #2 */
-
         /* Clear the ptr. */
         "5:\n\t"
-        "str xzr, %[rseq_tls]\n\t"
+        "str xzr, %[rseq_cs]\n\t"
         /* clang-format on */
 
-        : [ rseq_tls ] "=m"(rseq_tls.rseq_cs), [ restarts ] "=m"(restarts)
-        : [ cpu_mask_size ] "i"(sizeof(cpu_set_t)),
-          [ sysnum_setaffinity ] "i"(SYS_sched_setaffinity)
-        : "x0", "x1", "x2", "x8", "q0", "q1", "memory");
-#    else
-#        error Unsupported arch
-#    endif
-    /* This is expected to fail on a native run where restarts will be 0. */
-    assert(restarts > 0);
-#endif /* DEBUG */
+        : [rseq_cs] "=m"(reg_rseq->rseq_cs), [restarts] "=m"(restarts),
+          [commits] "=m"(commits)
+        :
+        : "x0", "q0", "q1", "memory");
+#else
+#    error Unsupported arch
+#endif
+    assert(restarts == 0);
+    assert(commits == 0);
 }
 
 #ifdef AARCH64
 static void
 test_rseq_writeback_store(void)
 {
+    volatile struct rseq *reg_rseq = get_my_rseq();
     __u32 id = RSEQ_CPU_ID_UNINITIALIZED;
     int array[2] = { 0 };
     int *index = array;
@@ -734,7 +944,7 @@ test_rseq_writeback_store(void)
         /* Store the entry into the ptr. */
         "adrp x0, rseq_cs_writeback\n\t"
         "add x0, x0, :lo12:rseq_cs_writeback\n\t"
-        "str x0, %[rseq_tls]\n\t"
+        "str x0, %[rseq_cs]\n\t"
         /* Test a register input to the sequence. */
         "ldr x0, %[cpu_id]\n\t"
         /* Test "falling into" the rseq region. */
@@ -767,11 +977,11 @@ test_rseq_writeback_store(void)
 
         /* Clear the ptr. */
         "5:\n\t"
-        "str xzr, %[rseq_tls]\n\t"
+        "str xzr, %[rseq_cs]\n\t"
         /* clang-format on */
 
-        : [ rseq_tls ] "=m"(rseq_tls.rseq_cs), [ id ] "=m"(id), [ index ] "=g"(index)
-        : [ cpu_id ] "m"(rseq_tls.cpu_id)
+        : [rseq_cs] "=m"(reg_rseq->rseq_cs), [id] "=m"(id), [index] "=g"(index)
+        : [cpu_id] "m"(reg_rseq->cpu_id)
         : "x0", "x1", "x2", "x28", "memory");
     assert(id != RSEQ_CPU_ID_UNINITIALIZED);
 }
@@ -785,10 +995,9 @@ rseq_thread_loop(void *arg)
      * in this function is close enough: the test already has non-determinism.
      */
     signal_cond_var(thread_ready);
-    rseq_tls.cpu_id = RSEQ_CPU_ID_UNINITIALIZED;
-    int res = syscall(SYS_rseq, &rseq_tls, sizeof(rseq_tls), 0, RSEQ_SIG);
-    if (res != 0)
-        return NULL;
+    bool res = register_rseq();
+    assert(res);
+    volatile struct rseq *reg_rseq = get_my_rseq();
     static int zero;
 #    ifdef X86
     __asm__ __volatile__(
@@ -799,7 +1008,7 @@ rseq_thread_loop(void *arg)
         "6:\n\t"
         /* Store the entry into the ptr. */
         "leaq rseq_cs_thread(%%rip), %%rax\n\t"
-        "movq %%rax, %[rseq_tls]\n\t"
+        "movq %%rax, %[rseq_cs]\n\t"
         /* Test "falling into" the rseq region. */
 
         /* Restartable sequence.  We loop to ensure we're in the region on
@@ -834,11 +1043,11 @@ rseq_thread_loop(void *arg)
 
         /* Clear the ptr. */
         "5:\n\t"
-        "movq $0, %[rseq_tls]\n\t"
+        "movq $0, %[rseq_cs]\n\t"
         /* clang-format on */
 
-        : [ rseq_tls ] "=m"(rseq_tls.rseq_cs), [ zero ] "=m"(zero)
-        : [ exit_requested ] "m"(exit_requested)
+        : [rseq_cs] "=m"(reg_rseq->rseq_cs), [zero] "=m"(zero)
+        : [exit_requested] "m"(exit_requested)
         : "rax", "memory");
 #    elif defined(AARCH64)
     __asm__ __volatile__(
@@ -850,7 +1059,7 @@ rseq_thread_loop(void *arg)
         /* Store the entry into the ptr. */
         "adrp x0, rseq_cs_thread\n\t"
         "add x0, x0, :lo12:rseq_cs_thread\n\t"
-        "str x0, %[rseq_tls]\n\t"
+        "str x0, %[rseq_cs]\n\t"
         /* Test "falling into" the rseq region. */
 
         /* Restartable sequence.  We loop to ensure we're in the region on
@@ -885,11 +1094,11 @@ rseq_thread_loop(void *arg)
 
         /* Clear the ptr. */
         "5:\n\t"
-        "str xzr, %[rseq_tls]\n\t"
+        "str xzr, %[rseq_cs]\n\t"
         /* clang-format on */
 
-        : [ rseq_tls ] "=m"(rseq_tls.rseq_cs), [ zero ] "=m"(zero)
-        : [ exit_requested ] "m"(exit_requested)
+        : [rseq_cs] "=m"(reg_rseq->rseq_cs), [zero] "=m"(zero)
+        : [exit_requested] "m"(exit_requested)
         : "x0", "x1", "memory");
 #    else
 #        error Unsupported arch
@@ -901,10 +1110,11 @@ static void
 kernel_xfer_event(void *drcontext, const dr_kernel_xfer_info_t *info)
 {
     static bool skip_print;
+    static int count;
     if (!skip_print)
         dr_fprintf(STDERR, "%s: type %d\n", __FUNCTION__, info->type);
     /* Avoid tons of prints for the trace loop in main(). */
-    if (info->type == DR_XFER_RSEQ_ABORT)
+    if (++count > 13)
         skip_print = true;
     dr_mcontext_t mc = { sizeof(mc) };
     mc.flags = DR_MC_CONTROL;
@@ -917,28 +1127,30 @@ kernel_xfer_event(void *drcontext, const dr_kernel_xfer_info_t *info)
     assert(ok);
     /* All transfer cases in this test should have source info. */
     assert(info->source_mcontext != NULL);
-    if (info->type == DR_XFER_RSEQ_ABORT) {
-        /* The interrupted context should be identical except the pc. */
-        assert(info->source_mcontext->pc != mc.pc);
+    /* For a migration, the context should be identical.
+     * For a signal it won't be as signal handler arguments will be set in
+     * registers and a sigaltstack may be set.
+     */
+    if (info->type == DR_XFER_RSEQ_ABORT && in_rseq_migration_test) {
+        /* The interrupted context should be identical, including the pc now
+         * that DR passes the abort handler PC just like the kernel does.
+         */
 #    ifdef X86
-        assert(info->source_mcontext->xax == mc.xax);
-        assert(info->source_mcontext->xcx == mc.xcx);
-        assert(info->source_mcontext->xdx == mc.xdx);
-        assert(info->source_mcontext->xbx == mc.xbx);
-        assert(info->source_mcontext->xsi == mc.xsi);
-        assert(info->source_mcontext->xdi == mc.xdi);
-        assert(info->source_mcontext->xbp == mc.xbp);
-        assert(info->source_mcontext->xsp == mc.xsp);
+        /* This compares the GPR's plus flags and PC. */
+        assert(memcmp(&info->source_mcontext->xdi, &mc.xdi,
+                      (byte *)&mc.padding - (byte *)&mc.xdi) == 0);
 #    elif defined(AARCH64)
+        assert(info->source_mcontext->pc == mc.pc);
         assert(memcmp(&info->source_mcontext->r0, &mc.r0, sizeof(mc.r0) * 32) == 0);
 #    else
 #        error Unsupported arch
 #    endif
 #    ifdef DEBUG /* See above: special code in core/ is DEBUG-only> */
-        /* Check that the interrupted PC for the true abort case is *prior* to the
-         * committing store.
+        /* Check that the interrupted PC for the true abort case is the handler.
+         * We could check this for every test if we wrote the expected handler
+         * into a global or something: does not seem worth the extra code.
          */
-        assert(info->source_mcontext->pc == (app_pc)test_rseq_native_abort_pre_commit);
+        assert(info->source_mcontext->pc == (app_pc)test_rseq_native_abort_handler);
 #    endif
     }
 }
@@ -946,8 +1158,9 @@ kernel_xfer_event(void *drcontext, const dr_kernel_xfer_info_t *info)
 DR_EXPORT void
 dr_client_main(client_id_t id, int argc, const char *argv[])
 {
-    /* Ensure DR_XFER_RSEQ_ABORT is rasied. */
+    /* Ensure DR_XFER_RSEQ_ABORT is raised. */
     dr_register_kernel_xfer_event(kernel_xfer_event);
+    drmemtrace_client_main(id, argc, argv);
 }
 #endif /* RSEQ_TEST_ATTACH */
 
@@ -955,10 +1168,13 @@ int
 main()
 {
     intercept_signal(SIGILL, signal_handler, false);
-    rseq_tls.cpu_id = RSEQ_CPU_ID_UNINITIALIZED;
-    int res = syscall(SYS_rseq, &rseq_tls, sizeof(rseq_tls), 0, RSEQ_SIG);
-    if (res == 0) {
+    if (register_rseq()) {
 #ifdef RSEQ_TEST_ATTACH
+        /* Set -offline to avoid trying to open a pipe to a missing reader. */
+        if (setenv("DYNAMORIO_OPTIONS",
+                   "-stderr_mask 0xc -client_lib ';;-offline -max_trace_size 256K'",
+                   1 /*override*/) != 0)
+            return 1;
         /* Create a thread that sits in the rseq region, to test attaching and detaching
          * from inside the region.
          */
@@ -974,6 +1190,8 @@ main()
         test_rseq_native_fault();
         /* Test a non-fault abort in the native run. */
         test_rseq_native_abort();
+        /* Test a side exit in the native run. */
+        test_rseq_side_exit();
         /* Test a trace. */
         int i;
         for (i = 0; i < 200; i++)
@@ -989,9 +1207,6 @@ main()
         join_thread(mythread);
         destroy_cond_var(thread_ready);
 #endif
-    } else {
-        /* Linux kernel 4.18+ is required. */
-        assert(errno == ENOSYS);
     }
     print("All done\n");
     return 0;

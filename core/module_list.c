@@ -1,5 +1,5 @@
 /* **********************************************************
- * Copyright (c) 2011-2021 Google, Inc.  All rights reserved.
+ * Copyright (c) 2011-2022 Google, Inc.  All rights reserved.
  * Copyright (c) 2008-2010 VMware, Inc.  All rights reserved.
  * **********************************************************/
 
@@ -233,7 +233,8 @@ module_list_remove_mapping(module_area_t *ma, app_pc map_start, app_pc map_end)
     ASSERT(os_get_module_info_write_locked());
     vmvector_remove(loaded_module_areas, map_start, map_end);
     LOG(GLOBAL, LOG_INTERP | LOG_VMAREAS, 2,
-        "\tmodule %s segment [" PFX "," PFX "] removed\n",
+        "\tmodule %s %s segment [" PFX "," PFX "] removed\n",
+        ma->full_path == NULL ? "<no path>" : ma->full_path,
         (GET_MODULE_NAME(&ma->names) == NULL) ? "<no name>" : GET_MODULE_NAME(&ma->names),
         map_start, map_end);
 }
@@ -260,7 +261,8 @@ module_list_add(app_pc base, size_t view_size, bool at_map,
         ASSERT(ma != NULL);
 
         LOG(GLOBAL, LOG_INTERP | LOG_VMAREAS, 1,
-            "module %s |%s| [" PFX "," PFX "] added\n",
+            "module %s %s |%s| [" PFX "," PFX "] added\n",
+            ma->full_path == NULL ? "<no path>" : ma->full_path,
             (GET_MODULE_NAME(&ma->names) == NULL) ? "<no name>"
                                                   : GET_MODULE_NAME(&ma->names),
             ma->names.file_name == NULL ? "<no file>" : ma->names.file_name, base,
@@ -643,7 +645,6 @@ ensure_section_readable(app_pc module_base, app_pc seg_start, size_t seg_len,
                         uint seg_chars, OUT uint *old_prot, app_pc view_start,
                         size_t view_len)
 {
-    int ok;
     app_pc intersection_start;
     size_t intersection_len;
 
@@ -673,15 +674,16 @@ ensure_section_readable(app_pc module_base, app_pc seg_start, size_t seg_len,
     SYSLOG_INTERNAL_WARNING("unreadable section @" PFX "\n", seg_start);
 #ifdef WINDOWS
     /* Preserve COW flags */
-    ok = protect_virtual_memory(intersection_start, intersection_len, PAGE_READONLY,
-                                old_prot);
+    DEBUG_DECLARE(bool ok =)
+    protect_virtual_memory(intersection_start, intersection_len, PAGE_READONLY, old_prot);
     ASSERT(ok);
     ASSERT_CURIOSITY(*old_prot == PAGE_NOACCESS ||
                      *old_prot == PAGE_WRITECOPY); /* expecting unmodifed even
                                                     * if writable */
 #else
     /* No other flags to preserve, should be no-access, so we ignore old_prot */
-    ok = os_set_protection(intersection_start, intersection_len, MEMPROT_READ);
+    DEBUG_DECLARE(bool ok =)
+    os_set_protection(intersection_start, intersection_len, MEMPROT_READ);
     ASSERT(ok);
 #endif
     return false;

@@ -99,6 +99,11 @@ bool dynamo_heap_initialized = false;
 bool dynamo_started = false;
 bool automatic_startup = false;
 bool control_all_threads = false;
+/* On Windows we can't really tell attach apart from our default late
+ * injection, and we do see early threads in place which is the point of
+ * this flag: so we always set it.
+ */
+bool dynamo_control_via_attach = IF_WINDOWS_ELSE(true, false);
 #ifdef WINDOWS
 bool dr_early_injected = false;
 int dr_early_injected_location = INJECT_LOCATION_Invalid;
@@ -162,8 +167,8 @@ DECLARE_NEVERPROT_VAR(byte *exception_stack, NULL);
 START_DATA_SECTION(NEVER_PROTECTED_SECTION, "w");
 
 /* spinlock used in assembly trampolines when we can't spare registers for more */
-mutex_t initstack_mutex VAR_IN_SECTION(NEVER_PROTECTED_SECTION) =
-    INIT_SPINLOCK_FREE(initstack_mutex);
+mutex_t initstack_mutex IF_AARCH64(__attribute__((aligned(8))))
+    VAR_IN_SECTION(NEVER_PROTECTED_SECTION) = INIT_SPINLOCK_FREE(initstack_mutex);
 byte *initstack_app_xsp VAR_IN_SECTION(NEVER_PROTECTED_SECTION) = 0;
 /* keeps track of how many threads are in cleanup_and_terminate */
 volatile int exiting_thread_count VAR_IN_SECTION(NEVER_PROTECTED_SECTION) = 0;
@@ -1322,11 +1327,7 @@ dynamo_process_exit_cleanup(void)
 {
     /* CAUTION: this should only be invoked after all app threads have stopped */
     if (!dynamo_exited && !INTERNAL_OPTION(nullcalls)) {
-        dcontext_t *dcontext;
-
         APP_EXPORT_ASSERT(dynamo_initialized, "Improper DynamoRIO initialization");
-
-        dcontext = get_thread_private_dcontext();
 
         /* we deliberately do NOT clean up d_r_initstack (which was
          * allocated using a separate mmap and so is not part of some
@@ -2740,6 +2741,7 @@ dr_app_setup(void)
     if (DATASEC_WRITABLE(DATASEC_RARELY_PROT) == 0)
         SELF_UNPROTECT_DATASEC(DATASEC_RARELY_PROT);
     dr_api_entry = true;
+    dynamo_control_via_attach = true;
     res = dynamorio_app_init();
     /* For dr_api_entry, we do not install all our signal handlers during init (to avoid
      * races: i#2335): we delay until dr_app_start().  Plus the vsyscall hook is
@@ -2928,6 +2930,9 @@ dynamorio_take_over_threads(dcontext_t *dcontext)
             os_thread_sleep(1);
     } while (found_threads && attempts < max_takeover_attempts);
     os_process_under_dynamorio_complete(dcontext);
+
+    instrument_post_attach_event();
+
     /* End the barrier to new threads. */
     signal_event(dr_attach_finished);
 

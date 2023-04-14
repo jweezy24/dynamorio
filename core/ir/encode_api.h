@@ -50,6 +50,7 @@ typedef enum _dr_isa_mode_t {
     DR_ISA_ARM_A32,           /**< ARM A32 (AArch32 ARM). */
     DR_ISA_ARM_THUMB,         /**< Thumb (ARM T32). */
     DR_ISA_ARM_A64,           /**< ARM A64 (AArch64). */
+    DR_ISA_RV64IMAFDC,        /**< RISC-V (rv64imafdc). */
 } dr_isa_mode_t;
 
 DR_API
@@ -72,6 +73,21 @@ DR_API
 dr_isa_mode_t
 dr_get_isa_mode(void *drcontext);
 
+/**
+ * AArch64 Scalable Vector Extension's vector length in bits is one of:
+ * 128 256 384 512 640 768 896 1024 1152 1280 1408 1536 1664 1792 1920 2048
+ * TODO i#3044: This function will only allow setting vector length if not
+ * running on SVE.
+ */
+void
+dr_set_sve_vl(int vl);
+
+/**
+ * Read AArch64 Scalable Vector Extension's vector length, in bits.
+ */
+int
+dr_get_sve_vl(void);
+
 enum {
 #ifdef X86
     MAX_INSTR_LENGTH = 17,
@@ -92,6 +108,10 @@ enum {
     /* With register lists we can see quite long operand lists. */
     MAX_SRC_OPNDS = 33, /* vstm s0-s31 */
     MAX_DST_OPNDS = MAX_SRC_OPNDS,
+#elif defined(RISCV64)
+    MAX_INSTR_LENGTH = 4,
+    MAX_SRC_OPNDS = 3,
+    MAX_DST_OPNDS = 1,
 #endif
 };
 

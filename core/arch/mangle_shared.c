@@ -188,6 +188,10 @@ prepare_for_clean_call(dcontext_t *dcontext, clean_call_info_t *cci, instrlist_t
 {
     uint dstack_offs = 0;
 
+    instr_t *start_label = INSTR_CREATE_label(dcontext);
+    instr_set_note(start_label, (void *)DR_NOTE_CALL_SEQUENCE_START);
+    PRE(ilist, instr, start_label);
+
     if (cci == NULL)
         cci = &default_clean_call_info;
 
@@ -427,6 +431,9 @@ cleanup_after_clean_call(dcontext_t *dcontext, clean_call_info_t *cci, instrlist
         PRE(ilist, instr,
             instr_create_restore_from_dcontext(dcontext, REG_XSP, XSP_OFFSET));
     }
+    instr_t *end_label = INSTR_CREATE_label(dcontext);
+    instr_set_note(end_label, (void *)DR_NOTE_CALL_SEQUENCE_END);
+    PRE(ilist, instr, end_label);
 }
 
 bool
@@ -499,7 +506,7 @@ insert_meta_call_vargs(dcontext_t *dcontext, instrlist_t *ilist, instr_t *instr,
      */
     direct = insert_reachable_cti(dcontext, ilist, instr, encode_pc, (byte *)callee,
                                   false /*call*/, TEST(META_CALL_RETURNS, flags),
-                                  false /*!precise*/, DR_REG_R11, NULL);
+                                  false /*!precise*/, CALL_SCRATCH_REG, NULL);
     if (stack_for_params > 0) {
         /* XXX PR 245936: let user decide whether to clean up?
          * i.e., support calling a stdcall routine?
@@ -570,7 +577,7 @@ insert_meta_call_vargs(dcontext_t *dcontext, instrlist_t *ilist, instr_t *instr,
 /*###########################################################################
  *###########################################################################
  *
- *   M A N G L I N G   R O U T I N E S
+ * MANGLING ROUTINES
  */
 
 /* This routine is not shared with drdecode, so it's here instead of mangle_utils.c. */
@@ -834,15 +841,33 @@ enum {
     DR_RSEQ_LABEL_CS = 3,
 };
 
+static inline void
+save_tls_or_dc(dcontext_t *dcontext, instrlist_t *ilist, instr_t *where, reg_id_t reg,
+               uint tls_offs, uint dc_offs)
+{
+    if (SCRATCH_ALWAYS_TLS()) {
+        PRE(ilist, where, instr_create_save_to_tls(dcontext, reg, tls_offs));
+    } else {
+        PRE(ilist, where, instr_create_save_to_dcontext(dcontext, reg, dc_offs));
+    }
+}
+
+static inline void
+restore_tls_or_dc(dcontext_t *dcontext, instrlist_t *ilist, instr_t *where, reg_id_t reg,
+                  uint tls_offs, uint dc_offs)
+{
+    if (SCRATCH_ALWAYS_TLS()) {
+        PRE(ilist, where, instr_create_restore_from_tls(dcontext, reg, tls_offs));
+    } else {
+        PRE(ilist, where, instr_create_restore_from_dcontext(dcontext, reg, dc_offs));
+    }
+}
+
 static instr_t *
 mangle_rseq_create_label(dcontext_t *dcontext, int type, ptr_uint_t data)
 {
     instr_t *label = INSTR_CREATE_label(dcontext);
     instr_set_note(label, (void *)DR_NOTE_RSEQ);
-    /* XXX: The note doesn't surivive encoding, so we also use a flag.  See comment in
-     * instr.h by this flag: maybe we should move a label's note somewhere persistent?
-     */
-    label->flags |= INSTR_RSEQ_ENDPOINT;
     dr_instr_label_data_t *label_data = instr_get_label_data_area(label);
     label_data->data[0] = type;
     label_data->data[1] = data;
@@ -855,13 +880,10 @@ mangle_rseq_write_exit_reason(dcontext_t *dcontext, instrlist_t *ilist,
                               instr_t *insert_at, reg_id_t scratch_reg)
 {
     /* We use slot 1 to avoid conflict with segment mangling. */
+    save_tls_or_dc(dcontext, ilist, insert_at, scratch_reg, TLS_REG1_SLOT, REG1_OFFSET);
     if (SCRATCH_ALWAYS_TLS()) {
-        PRE(ilist, insert_at,
-            instr_create_save_to_tls(dcontext, scratch_reg, TLS_REG1_SLOT));
         insert_get_mcontext_base(dcontext, ilist, insert_at, scratch_reg);
     } else {
-        PRE(ilist, insert_at,
-            instr_create_save_to_dcontext(dcontext, scratch_reg, REG1_OFFSET));
         insert_mov_immed_ptrsz(dcontext, (ptr_int_t)dcontext,
                                opnd_create_reg(scratch_reg), ilist, insert_at, NULL,
                                NULL);
@@ -875,23 +897,20 @@ mangle_rseq_write_exit_reason(dcontext_t *dcontext, instrlist_t *ilist,
     insert_mov_immed_ptrsz(dcontext, EXIT_REASON_RSEQ_ABORT, opnd_create_reg(scratch2),
                            ilist, insert_at, NULL, NULL);
 #    endif
+    /* FIXME i#3544: Not implemented */
     PRE(ilist, insert_at,
-        XINST_CREATE_store_2bytes(dcontext,
-                                  opnd_create_dcontext_field_via_reg_sz(
-                                      dcontext, scratch_reg, EXIT_REASON_OFFSET, OPSZ_2),
-                                  IF_X86_ELSE(OPND_CREATE_INT16(EXIT_REASON_RSEQ_ABORT),
-                                              opnd_create_reg(scratch2))));
+        XINST_CREATE_store_2bytes(
+            dcontext,
+            opnd_create_dcontext_field_via_reg_sz(dcontext, scratch_reg,
+                                                  EXIT_REASON_OFFSET, OPSZ_2),
+            IF_AARCHXX_ELSE(opnd_create_reg(scratch2),
+                            OPND_CREATE_INT16(EXIT_REASON_RSEQ_ABORT))));
 #    ifdef AARCHXX
     PRE(ilist, insert_at,
         instr_create_restore_from_tls(dcontext, scratch2, TLS_REG2_SLOT));
 #    endif
-    if (SCRATCH_ALWAYS_TLS()) {
-        PRE(ilist, insert_at,
-            instr_create_restore_from_tls(dcontext, scratch_reg, TLS_REG1_SLOT));
-    } else {
-        PRE(ilist, insert_at,
-            instr_create_restore_from_dcontext(dcontext, scratch_reg, REG1_OFFSET));
-    }
+    restore_tls_or_dc(dcontext, ilist, insert_at, scratch_reg, TLS_REG1_SLOT,
+                      REG1_OFFSET);
 }
 
 /* May modify next_instr. */
@@ -929,23 +948,14 @@ mangle_rseq_insert_native_sequence(dcontext_t *dcontext, instrlist_t *ilist,
     RSTATS_INC(num_rseq_native_calls_inserted);
     instr_t *insert_at = *next_instr;
 
-    /* We assume that by making this a block end, clients will restore app state
-     * before this native invocation.
-     * TODO i#2350: Take some further action to better guarantee this in the face
-     * of future drreg optimizations, etc.  Do we need new interface features, or
-     * do we live with a fake app jump or sthg?
+    /* We've already inserted a DR_NOTE_REG_BARRIER label to ensure that clients will
+     * restore app state before this native invocation.
      */
 
     /* Create a scratch register. Use slot 1 to avoid conflict with segment
      * mangling below.
      */
-    if (SCRATCH_ALWAYS_TLS()) {
-        PRE(ilist, insert_at,
-            instr_create_save_to_tls(dcontext, scratch_reg, TLS_REG1_SLOT));
-    } else {
-        PRE(ilist, insert_at,
-            instr_create_save_to_dcontext(dcontext, scratch_reg, REG1_OFFSET));
-    }
+    save_tls_or_dc(dcontext, ilist, insert_at, scratch_reg, TLS_REG1_SLOT, REG1_OFFSET);
     /* Restore the entry state we preserved earlier. */
     if (reg_written_count > 0) {
         if (SCRATCH_ALWAYS_TLS())
@@ -960,6 +970,23 @@ mangle_rseq_insert_native_sequence(dcontext_t *dcontext, instrlist_t *ilist,
             if (reg_written[i]) {
                 /* XXX: Keep this consistent with instr_is_rseq_load() in translate.c. */
                 size_t offs = offsetof(dcontext_t, rseq_entry_state) + sizeof(reg_t) * i;
+#    ifdef AARCH64
+                if (DR_REG_START_GPR + (reg_id_t)i == DR_REG_SP) {
+                    /* Unfortunately SP cannot be directly loaded into. */
+                    reg_id_t scratch2 = scratch_reg == DR_REG_X0 ? DR_REG_X1 : DR_REG_X0;
+                    save_tls_or_dc(dcontext, ilist, insert_at, scratch2, TLS_REG1_SLOT,
+                                   REG1_OFFSET);
+                    PRE(ilist, insert_at,
+                        XINST_CREATE_load(dcontext, opnd_create_reg(scratch2),
+                                          OPND_CREATE_MEMPTR(scratch_reg, offs)));
+                    PRE(ilist, insert_at,
+                        XINST_CREATE_move(dcontext, opnd_create_reg(DR_REG_SP),
+                                          opnd_create_reg(scratch2)));
+                    restore_tls_or_dc(dcontext, ilist, insert_at, scratch2, TLS_REG1_SLOT,
+                                      REG1_OFFSET);
+                    continue;
+                }
+#    endif
                 PRE(ilist, insert_at,
                     XINST_CREATE_load(dcontext,
                                       opnd_create_reg(DR_REG_START_GPR + (reg_id_t)i),
@@ -992,7 +1019,7 @@ mangle_rseq_insert_native_sequence(dcontext_t *dcontext, instrlist_t *ilist,
     /* XXX i#2350: This may still have trouble with decode_fragment() if it
      * happens to look like a branch or invalid opcode.
      */
-    instr_t *abort_sig = INSTR_CREATE_nop(dcontext);
+    instr_t *abort_sig = XINST_CREATE_nop(dcontext);
     instr_allocate_raw_bits(dcontext, abort_sig, sizeof(signature));
     instr_set_raw_word(abort_sig, 0, (uint)signature);
 #    endif
@@ -1045,6 +1072,10 @@ mangle_rseq_insert_native_sequence(dcontext_t *dcontext, instrlist_t *ilist,
                                   rseq_get_tls_ptr_offset(), OPSZ_PTR),
         opnd_create_reg(scratch_reg));
     instrlist_preinsert(ilist, insert_at, start_mangling);
+#    elif defined(RISCV64)
+    /* FIXME i#3544: Not implemented */
+    ASSERT_NOT_IMPLEMENTED(false);
+    instr_t *start_mangling = NULL;
 #    else
     /* We need another scratch reg to write to TLS. */
     ASSERT(SCRATCH_ALWAYS_TLS());
@@ -1065,13 +1096,8 @@ mangle_rseq_insert_native_sequence(dcontext_t *dcontext, instrlist_t *ilist,
 #    endif
 
     /* Restore scratch_reg. */
-    if (SCRATCH_ALWAYS_TLS()) {
-        PRE(ilist, insert_at,
-            instr_create_restore_from_tls(dcontext, scratch_reg, TLS_REG1_SLOT));
-    } else {
-        PRE(ilist, insert_at,
-            instr_create_restore_from_dcontext(dcontext, scratch_reg, REG1_OFFSET));
-    }
+    restore_tls_or_dc(dcontext, ilist, insert_at, scratch_reg, TLS_REG1_SLOT,
+                      REG1_OFFSET);
 
     /* Make a local copy of the rseq code (otherwise we would have to assume that
      * all rseq sequences are callees with a nice return to come back to us, which
@@ -1178,6 +1204,9 @@ mangle_rseq_insert_native_sequence(dcontext_t *dcontext, instrlist_t *ilist,
                                                LIB_SEG_TLS, DR_REG_NULL, DR_REG_NULL, 0,
                                                rseq_get_tls_ptr_offset(), OPSZ_PTR),
                                            OPND_CREATE_INT32(0)));
+#    elif defined(RISCV64)
+    /* FIXME i#3544: Not implemented */
+    ASSERT_NOT_IMPLEMENTED(false);
 #    else
     PRE(ilist, insert_at, instr_create_save_to_tls(dcontext, scratch2, TLS_REG2_SLOT));
     instrlist_preinsert(ilist, insert_at,
@@ -1319,13 +1348,10 @@ mangle_rseq(dcontext_t *dcontext, instrlist_t *ilist, instr_t *instr,
          * we're ok for now, but we may want some kind of barrier API in the future.
          */
         instr_t *first = instrlist_first(ilist);
+        save_tls_or_dc(dcontext, ilist, first, scratch_reg, TLS_REG0_SLOT, REG0_OFFSET);
         if (SCRATCH_ALWAYS_TLS()) {
-            PRE(ilist, first,
-                instr_create_save_to_tls(dcontext, scratch_reg, TLS_REG0_SLOT));
             insert_get_mcontext_base(dcontext, ilist, first, scratch_reg);
         } else {
-            PRE(ilist, first,
-                instr_create_save_to_dcontext(dcontext, scratch_reg, REG0_OFFSET));
             insert_mov_immed_ptrsz(dcontext, (ptr_int_t)dcontext,
                                    opnd_create_reg(scratch_reg), ilist, first, NULL,
                                    NULL);
@@ -1333,23 +1359,37 @@ mangle_rseq(dcontext_t *dcontext, instrlist_t *ilist, instr_t *instr,
         for (i = 0; i < DR_NUM_GPR_REGS; i++) {
             if (reg_written[i]) {
                 size_t offs = offsetof(dcontext_t, rseq_entry_state) + sizeof(reg_t) * i;
+#    ifdef AARCH64
+                if (DR_REG_START_GPR + (reg_id_t)i == DR_REG_SP) {
+                    /* Unfortunately SP cannot be directly stored. */
+                    reg_id_t scratch2 = scratch_reg == DR_REG_X0 ? DR_REG_X1 : DR_REG_X0;
+                    save_tls_or_dc(dcontext, ilist, first, scratch2, TLS_REG1_SLOT,
+                                   REG1_OFFSET);
+                    PRE(ilist, first,
+                        XINST_CREATE_move(dcontext, opnd_create_reg(scratch2),
+                                          opnd_create_reg(DR_REG_SP)));
+                    PRE(ilist, first,
+                        XINST_CREATE_store(dcontext,
+                                           OPND_CREATE_MEMPTR(scratch_reg, offs),
+                                           opnd_create_reg(scratch2)));
+                    restore_tls_or_dc(dcontext, ilist, first, scratch2, TLS_REG1_SLOT,
+                                      REG1_OFFSET);
+                    continue;
+                }
+#    endif
                 PRE(ilist, first,
                     XINST_CREATE_store(dcontext, OPND_CREATE_MEMPTR(scratch_reg, offs),
                                        opnd_create_reg(DR_REG_START_GPR + (reg_id_t)i)));
             }
         }
-        if (SCRATCH_ALWAYS_TLS()) {
-            PRE(ilist, first,
-                instr_create_restore_from_tls(dcontext, scratch_reg, TLS_REG0_SLOT));
-        } else {
-            PRE(ilist, first,
-                instr_create_restore_from_dcontext(dcontext, scratch_reg, REG0_OFFSET));
-        }
+        restore_tls_or_dc(dcontext, ilist, first, scratch_reg, TLS_REG0_SLOT,
+                          REG0_OFFSET);
     }
     int len = instr_length(dcontext, instr);
     if (pc + len >= end) {
         ilist->flags |= INSTR_RSEQ_ENDPOINT;
-        *flags |= FRAG_HAS_RSEQ_ENDPOINT;
+        /* We should already have this flag set by the bb builder. */
+        ASSERT(TEST(FRAG_HAS_RSEQ_ENDPOINT, *flags));
         if (pc + len != end) {
             REPORT_FATAL_ERROR_AND_EXIT(
                 RSEQ_BEHAVIOR_UNSUPPORTED, 3, get_application_name(),
@@ -1365,7 +1405,28 @@ mangle_rseq(dcontext_t *dcontext, instrlist_t *ilist, instr_t *instr,
             ASSERT_NOT_REACHED();
         }
         rseq_set_final_instr_pc(start, pc);
-        mangle_rseq_insert_native_sequence(dcontext, ilist, instr, next_instr, flags,
+        /* We need to insert the native sequence before the barrier label,
+         * as that is where the app code has native values.
+         * It is possible a client inserted code in between so we have to go
+         * and find it.
+         */
+        instr_t *find = *next_instr;
+        while (find != NULL &&
+               !(instr_is_label(find) &&
+                 instr_get_note(find) == (void *)DR_NOTE_REG_BARRIER))
+            find = instr_get_next(find);
+        if (find == NULL) {
+            REPORT_FATAL_ERROR_AND_EXIT(
+                RSEQ_BEHAVIOR_UNSUPPORTED, 3, get_application_name(),
+                get_application_pid(),
+                "Rseq sequence DR_NOTE_REG_BARRIER must not be deleted");
+            ASSERT_NOT_REACHED();
+        }
+        instr_t *where_next = instr_get_next(find);
+        /* We actually don't need to set next_instr because the inserted native code
+         * is still beyond the next_instr of this app instr.
+         */
+        mangle_rseq_insert_native_sequence(dcontext, ilist, find, &where_next, flags,
                                            start, end, handler, scratch_reg, reg_written,
                                            reg_written_count);
         /* TODO i#2350: We should also invoke the native sequence on a midpoint exit
@@ -1395,14 +1456,11 @@ mangle_rseq_finalize(dcontext_t *dcontext, instrlist_t *ilist, fragment_t *f)
     instr_t *instr, *immed_first = NULL, *immed_last = NULL;
     cache_pc pc = FCACHE_ENTRY_PC(f), immed_start_pc = NULL;
     cache_pc rseq_start = NULL, rseq_end = NULL, rseq_abort = NULL;
+    DEBUG_DECLARE(int label_sets_found = 0;)
     for (instr = instrlist_first(ilist); instr != NULL; instr = instr_get_next(instr)) {
-        if (instr_is_label(instr) &&
-            (instr_get_note(instr) == (void *)DR_NOTE_RSEQ ||
-             TEST(INSTR_RSEQ_ENDPOINT, instr->flags))) {
+        if (instr_is_label(instr) && instr_get_note(instr) == (void *)DR_NOTE_RSEQ) {
             dr_instr_label_data_t *label_data = instr_get_label_data_area(instr);
             switch (label_data->data[0]) {
-            case DR_RSEQ_LABEL_START: rseq_start = pc; break;
-            case DR_RSEQ_LABEL_END: rseq_end = pc; break;
             case DR_RSEQ_LABEL_ABORT: rseq_abort = pc; break;
             case DR_RSEQ_LABEL_CS:
                 immed_start_pc = pc;
@@ -1419,26 +1477,43 @@ mangle_rseq_finalize(dcontext_t *dcontext, instrlist_t *ilist, fragment_t *f)
                     }
                 }
                 break;
+            case DR_RSEQ_LABEL_START: rseq_start = pc; break;
+            case DR_RSEQ_LABEL_END: {
+                rseq_end = pc;
+                /* We assume this is the 4th and last label.  We handle it here,
+                 * so we can start over on a new set if there are multiple rseq
+                 * regions (such as from duplicated app copies by drbbdup).
+                 */
+                IF_DEBUG(++label_sets_found;)
+                ASSERT(rseq_start != NULL && rseq_abort != NULL);
+                byte *rseq_cs_alloc, *rseq_cs;
+                /* The rseq_cs creation and recording is structured like this in two steps
+                 * to provide flexibility in mangling.  Originally the alloc was done in
+                 * mangle_rseq() and passed here in the label data, but to simplify
+                 * freeing we now allocate here and patch the immediates.
+                 */
+                rseq_cs_alloc = rseq_get_rseq_cs_alloc(&rseq_cs);
+                rseq_record_rseq_cs(rseq_cs_alloc, f, rseq_start, rseq_end, rseq_abort);
+                ASSERT(immed_start_pc != NULL && immed_first != NULL);
+                LOG(THREAD, LOG_INTERP, 4, "%s: start=%p, end=%p, abort=%p stored @%p\n",
+                    __FUNCTION__, rseq_start, rseq_end, rseq_abort, rseq_cs);
+                patch_mov_immed_ptrsz(dcontext, (ptr_int_t)rseq_cs, immed_start_pc,
+                                      immed_first, immed_last);
+                DODEBUG({
+                    rseq_abort = NULL;
+                    rseq_start = NULL;
+                    immed_start_pc = NULL;
+                    immed_first = NULL;
+                });
+                break;
+            }
             default: ASSERT_NOT_REACHED();
             }
         }
         pc += instr_length(dcontext, instr);
     }
-    ASSERT(rseq_start != NULL && rseq_end != NULL && rseq_abort != NULL);
-
-    byte *rseq_cs_alloc, *rseq_cs;
-    /* The rseq_cs creation and recording is structured like this in two steps to
-     * provide flexibility in mangling.  Originally the alloc was done in mangle_rseq()
-     * and passed here in the label data, but to simplify freeing we now allocate here
-     * and patch the immediates.
-     */
-    rseq_cs_alloc = rseq_get_rseq_cs_alloc(&rseq_cs);
-    rseq_record_rseq_cs(rseq_cs_alloc, f, rseq_start, rseq_end, rseq_abort);
-    ASSERT(immed_start_pc != NULL && immed_first != NULL);
-    LOG(THREAD, LOG_INTERP, 4, "%s: start=%p, end=%p, abort=%p stored @%p\n",
-        __FUNCTION__, rseq_start, rseq_end, rseq_abort, rseq_cs);
-    patch_mov_immed_ptrsz(dcontext, (ptr_int_t)rseq_cs, immed_start_pc, immed_first,
-                          immed_last);
+    /* We should have found at least one set of labels. */
+    ASSERT(label_sets_found > 0);
 }
 #endif /* LINUX */
 
@@ -1707,9 +1782,9 @@ d_r_mangle(dcontext_t *dcontext, instrlist_t *ilist, uint *flags INOUT, bool man
 
         if (!instr_is_cti(instr) || instr_is_meta(instr)) {
             if (TEST(INSTR_CLOBBER_RETADDR, instr->flags) && instr_is_label(instr)) {
-                /* move the value to the note field (which the client cannot
+                /* Move the value to the offset field (which the client cannot
                  * possibly use at this point) so we don't have to search for
-                 * this label when we hit the ret instr
+                 * this label when we hit the ret instr.
                  */
                 dr_instr_label_data_t *data = instr_get_label_data_area(instr);
                 instr_t *tmp;
@@ -1725,7 +1800,7 @@ d_r_mangle(dcontext_t *dcontext, instrlist_t *ilist, uint *flags INOUT, bool man
                 for (tmp = instr_get_next(instr); tmp != NULL;
                      tmp = instr_get_next(tmp)) {
                     if (tmp == ret) {
-                        tmp->note = (void *)data->data[1]; /* the value to use */
+                        tmp->offset = data->data[1]; /* the value to use */
                         break;
                     }
                 }

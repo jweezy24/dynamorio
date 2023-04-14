@@ -450,9 +450,11 @@ os_map_file(file_t f, size_t *size INOUT, uint64 offs, app_pc addr, uint prot,
 {
     int flags;
     byte *map;
+#if defined(LINUX) && !defined(X64)
     uint pg_offs;
     ASSERT_TRUNCATE(pg_offs, uint, offs / PAGE_SIZE);
     pg_offs = (uint)(offs / PAGE_SIZE);
+#endif
 #ifdef VMX86_SERVER
     flags = MAP_PRIVATE; /* MAP_SHARED not supported yet */
 #else
@@ -492,6 +494,8 @@ const reg_id_t syscall_regparms[MAX_SYSCALL_ARGS] = {
 #    endif /* 64/32-bit */
 #elif defined(AARCHXX)
     DR_REG_R0, DR_REG_R1, DR_REG_R2, DR_REG_R3, DR_REG_R4, DR_REG_R5,
+#elif defined(RISCV64)
+    DR_REG_A0, DR_REG_A1, DR_REG_A2, DR_REG_A3, DR_REG_A4, DR_REG_A5,
 #endif /* X86/ARM */
 };
 
@@ -504,6 +508,8 @@ const reg_id_t syscall_regparms[MAX_SYSCALL_ARGS] = {
  * the disassembly of those functions: there should be no relocations.
  */
 static size_t page_size = 0;
+
+static size_t auxv_minsigstksz = 0;
 
 /* Return true if size is a multiple of the page size.
  * XXX: This function may be called when DynamoRIO is in a fragile state, or not
@@ -573,6 +579,22 @@ os_page_size(void)
     return size;
 }
 
+/* With SIGSTKSZ now in sysconf and an auxv var AT_MINSIGSTKSZ we avoid
+ * using the defines and try to lookup the min value in os_page_size_init().
+ */
+size_t
+os_minsigstksz(void)
+{
+#ifdef AARCH64
+#    define MINSIGSTKSZ_DEFAULT 5120
+#else
+#    define MINSIGSTKSZ_DEFAULT 2048
+#endif
+    if (auxv_minsigstksz == 0)
+        return MINSIGSTKSZ_DEFAULT;
+    return auxv_minsigstksz;
+}
+
 void
 os_page_size_init(const char **env, bool env_followed_by_auxv)
 {
@@ -591,12 +613,18 @@ os_page_size_init(const char **env, bool env_followed_by_auxv)
         /* Skip environment. */
         while (*env != 0)
             ++env;
-        /* Look for AT_PAGESZ in the auxiliary vector. */
+        /* Look for AT_PAGESZ and other values in the auxiliary vector. */
         for (auxv = (ELF_AUXV_TYPE *)(env + 1); auxv->a_type != AT_NULL; auxv++) {
             if (auxv->a_type == AT_PAGESZ) {
                 os_set_page_size(auxv->a_un.a_val);
                 break;
             }
+#    ifdef AT_MINSIGSTKSZ
+            else if (auxv->a_type == AT_MINSIGSTKSZ) {
+                auxv_minsigstksz = auxv->a_un.a_val;
+                break;
+            }
+#    endif
         }
     }
 #endif /* LINUX */

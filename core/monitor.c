@@ -1,5 +1,5 @@
 /* **********************************************************
- * Copyright (c) 2012-2021 Google, Inc.  All rights reserved.
+ * Copyright (c) 2012-2022 Google, Inc.  All rights reserved.
  * Copyright (c) 2000-2010 VMware, Inc.  All rights reserved.
  * **********************************************************/
 
@@ -646,8 +646,7 @@ mark_trace_head(dcontext_t *dcontext_in, fragment_t *f, fragment_t *src_f,
     ASSERT(!NEED_SHARED_LOCK(f->flags) || self_owns_recursive_lock(&change_linking_lock));
 
     if (thcounter_lookup(dcontext, f->tag) == NULL) {
-    protected
-        = local_heap_protected(dcontext);
+        protected = local_heap_protected(dcontext);
         if (protected) {
             /* unprotect local heap */
             protect_local_heap(dcontext, WRITABLE);
@@ -1110,7 +1109,10 @@ get_and_check_add_size(dcontext_t *dcontext, fragment_t *f, uint *res_add_size,
 static inline uint
 trace_flags_from_component_flags(uint flags)
 {
-    return (flags & (FRAG_HAS_SYSCALL | FRAG_HAS_DIRECT_CTI IF_X86_64(| FRAG_32_BIT)));
+    return (flags &
+            (FRAG_HAS_SYSCALL |
+             FRAG_HAS_DIRECT_CTI IF_X86_64(
+                 | FRAG_32_BIT IF_LINUX(| FRAG_HAS_RSEQ_ENDPOINT))));
 }
 
 static inline uint
@@ -1147,7 +1149,7 @@ end_and_emit_trace(dcontext_t *dcontext, fragment_t *cur_f)
     fragment_t wrapper;
     uint i;
     /* was the trace passed through optimizations or the client interface? */
-    bool externally_mangled = false;
+    DEBUG_DECLARE(bool externally_mangled = false;)
     /* we cannot simply upgrade a basic block fragment
      * to a trace b/c traces have prefixes that basic blocks don't!
      */
@@ -1176,7 +1178,7 @@ end_and_emit_trace(dcontext_t *dcontext, fragment_t *cur_f)
          */
         dr_emit_flags_t emitflags =
             instrument_trace(dcontext, tag, &md->unmangled_ilist, false /*!recreating*/);
-        externally_mangled = true;
+        DODEBUG(externally_mangled = true;);
         if (TEST(DR_EMIT_STORE_TRANSLATIONS, emitflags)) {
             /* PR 214962: let client request storage instead of recreation */
             md->trace_flags |= FRAG_HAS_TRANSLATION_INFO;
@@ -1290,7 +1292,7 @@ end_and_emit_trace(dcontext_t *dcontext, fragment_t *cur_f)
 #    endif
     ) {
         optimize_trace(dcontext, tag, trace);
-        externally_mangled = true;
+        DODEBUG(externally_mangled = true;);
     }
 #endif /* INTERNAL */
 
